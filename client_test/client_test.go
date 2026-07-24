@@ -251,4 +251,89 @@ var _ = Describe("Client Tests", func() {
 		})
 
 	})
+
+	Describe("InitUser Integration Tests", func() {
+    	Specify("successfully initializes a normal user", func() {
+        	alice, err := client.InitUser("alice", "password")
+
+        	Expect(err).To(BeNil())
+        	Expect(alice).ToNot(BeNil())
+    	})
+
+    	Specify("rejects an empty username", func() {
+        	emptyUser, err := client.InitUser("", "password")
+
+        	Expect(err).ToNot(BeNil())
+        	Expect(emptyUser).To(BeNil())
+    	})
+
+    	Specify("accepts an empty password", func() {
+        	alice, err := client.InitUser("alice", "")
+
+        	Expect(err).To(BeNil())
+        	Expect(alice).ToNot(BeNil())
+    	})
+
+    	Specify("rejects duplicate usernames with the same password", func() {
+        	firstAlice, err := client.InitUser("alice", "password")
+        	Expect(err).To(BeNil())
+        	Expect(firstAlice).ToNot(BeNil())
+
+        	secondAlice, err := client.InitUser("alice", "password")
+
+        	Expect(err).ToNot(BeNil())
+        	Expect(secondAlice).To(BeNil())
+    	})
+
+    	Specify("rejects duplicate usernames with different passwords", func() {
+        	firstAlice, err := client.InitUser("alice", "first-password")
+        	Expect(err).To(BeNil())
+        	Expect(firstAlice).ToNot(BeNil())
+
+        	secondAlice, err := client.InitUser("alice", "different-password")
+
+        	Expect(err).ToNot(BeNil())
+        	Expect(secondAlice).To(BeNil())
+    	})
+
+    	Specify("allows different users to use the same password", func() {
+        	alice, err := client.InitUser("alice", "shared-password")
+        	Expect(err).To(BeNil())
+        	Expect(alice).ToNot(BeNil())
+
+        	bob, err := client.InitUser("bob", "shared-password")
+        	Expect(err).To(BeNil())
+        	Expect(bob).ToNot(BeNil())
+    	})
+
+    	Specify("treats usernames as case-sensitive", func() {
+        	lowercase, err := client.InitUser("alice", "password")
+        	Expect(err).To(BeNil())
+        	Expect(lowercase).ToNot(BeNil())
+
+        	uppercase, err := client.InitUser("Alice", "password")
+        	Expect(err).To(BeNil())
+        	Expect(uppercase).ToNot(BeNil())
+    	})
+
+    	Specify("accepts nonempty usernames containing punctuation", func() {
+        	user, err := client.InitUser(
+            	"alice-test@example.com",
+            	"password",
+        	)
+
+        	Expect(err).To(BeNil())
+        	Expect(user).ToNot(BeNil())
+    	})
+
+    	Specify("accepts a long password", func() {
+        	user, err := client.InitUser(
+            	"alice",
+            	"this-is-a-long-password-with-many-characters-1234567890",
+        	)
+
+        	Expect(err).To(BeNil())
+        	Expect(user).ToNot(BeNil())
+    	})
+	})
 })

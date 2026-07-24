@@ -29,6 +29,7 @@ import (
 	. "github.com/onsi/gomega"
 	_ "strconv"
 	_ "strings"
+	_ "encoding/json"
 )
 
 func TestSetupAndExecution(t *testing.T) {
@@ -42,6 +43,50 @@ var _ = Describe("Client Unit Tests", func() {
 		userlib.DatastoreClear()
 		userlib.KeystoreClear()
 	})
+
+	// func decryptStoredAccountForTest(
+    // 	username string,
+    // 	password string,
+	// ) (Account, AuthenticatedEnvelope) {
+    // 	accountUUID, err := getUserUUID(username)
+    // 	Expect(err).To(BeNil())
+
+    // 	storedBytes, exists := userlib.DatastoreGet(accountUUID)
+    // 	Expect(exists).To(BeTrue())
+    // 	Expect(storedBytes).ToNot(BeEmpty())
+
+    // 	var envelope AuthenticatedEnvelope
+    // 	err = json.Unmarshal(storedBytes, &envelope)
+    // 	Expect(err).To(BeNil())
+
+    // 	Expect(envelope.Version).To(Equal(currentVersion))
+    // 	Expect(len(envelope.Ciphertext)).To(
+    //     	BeNumerically(">=", userlib.AESBlockSizeBytes),
+    // 	)
+    // 	Expect(len(envelope.MAC)).To(Equal(userlib.HashSizeBytes))
+
+    // 	encKey, macKey, err := deriveAccountKey(
+    // 	    username,
+    // 	    password,
+    // 	    accountUUID,
+    // 	)
+    // 	Expect(err).To(BeNil())
+
+    // 	expectedMAC, err := userlib.HMACEval(
+    // 	    macKey,
+    // 	    accountMACMessage(accountUUID, envelope.Ciphertext),
+    // 	)
+    // 	Expect(err).To(BeNil())
+    // 	Expect(userlib.HMACEqual(expectedMAC, envelope.MAC)).To(BeTrue())
+
+    // 	plaintext := userlib.SymDec(encKey, envelope.Ciphertext)
+
+    // 	var account Account
+    // 	err = json.Unmarshal(plaintext, &account)
+    // 	Expect(err).To(BeNil())
+
+    // 	return account, envelope
+	// }
 
 	Describe("Unit Tests", func() {
 		Specify("Basic Test: Check that the Username field is set for a new user", func() {
@@ -57,4 +102,17 @@ var _ = Describe("Client Unit Tests", func() {
 			Expect(alice.Username).To(Equal("alice"))
 		})
 	})
+
+	// Describe("InitUser white-box tests", func() {
+    // 	Specify("creates complete local user state", func() {
+    //     	alice, err := InitUser("alice", "password")
+
+    //     	Expect(err).To(BeNil())
+    //     	Expect(alice).ToNot(BeNil())
+    //     	Expect(alice.Username).To(Equal("alice"))
+    //     	Expect(alice.NamespaceRoot).To(HaveLen(16))
+    //     	Expect(alice.PKEPrivate.KeyType).To(Equal("PKE"))
+    //     	Expect(alice.SignPrivate.KeyType).To(Equal("DS"))
+    // 	})
+	// })
 })

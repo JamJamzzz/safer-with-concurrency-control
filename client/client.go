@@ -33,6 +33,8 @@ import (
 
 	// Optional.
 	_ "strconv"
+
+	"encoding/hex"
 )
 
 // This serves two purposes: it shows you a few useful primitives,
@@ -105,12 +107,17 @@ func someUsefulThings() {
 	_ = fmt.Sprintf("%s_%d", "file", 1)
 }
 
+//Constant variables
+const symmetricKeySize = 16
+
 // This is the type definition for the User struct.
 // A Go struct is like a Python or Java class - it can have attributes
 // (e.g. like the Username attribute) and methods (e.g. like the StoreFile method below).
 type User struct {
-	Username string
-
+	Username      string
+	NamespaceRoot []byte
+	PKEPrivate    userlib.PKEDecKey //Used to decrypt the ciphertext
+	SignPrivate   userlib.DSSignKey //Used for sign digital signature
 	// You can add other attributes here if you want! But note that in order for attributes to
 	// be included when this struct is serialized to/from JSON, they must be capitalized.
 	// On the flipside, if you have an attribute that you want to be able to access from
@@ -119,11 +126,223 @@ type User struct {
 	// begins with a lowercase letter).
 }
 
+type Account struct {
+	UsernameHash  []byte
+	NamespaceRoot []byte
+	PKEPrivate    userlib.PKEDecKey
+	SignPrivate   userlib.DSSignKey
+}
+
+//Wrap the account and stored in an envelope
+type AuthenticatedEnvelope struct {
+	Ciphertext []byte
+	MAC        []byte
+}
+
+//Basic Helper Methods:
+
+/**
+Helper Method for InitUser
+ **/
+func getUserUUID(username string) (uuid.UUID, error) {
+	userHash := userlib.Hash([]byte("user-record-" + username))
+	//Casting from the bytes to uuid
+	return uuid.FromBytes(userHash[:16])
+}
+
+//key generation:
+//Generate the public key
+func publicKeyName(domain string, username string) string {
+	nameHash := userlib.Hash([]byte(domain + ":" + username))
+	return hex.EncodeToString(nameHash[:16])
+}
+
+//Used to enc the account
+func getPKEKeyName(username string) string {
+	return publicKeyName("pke-public-key", username)
+}
+
+//Used to verify the d.s.
+func getVerifyKeyName(username string) string {
+	return publicKeyName("signature-verify-key", username)
+}
+
+//To check whether this account is taken or not
+func isUsernameTaken(username string, accountUUID uuid.UUID) bool {
+	_, accountExists := userlib.DatastoreGet(accountUUID)
+	_, pkeExists := userlib.KeystoreGet(getPKEKeyName(username))
+	_, verifyExists := userlib.KeystoreGet(getVerifyKeyName(username))
+
+	return accountExists || pkeExists || verifyExists
+}
+
+//derive the secret keys for enc and mac
+func deriveAccountKey(username string, password string, accountUUID uuid.UUID) (
+	encKey []byte, macKey []byte, err error,
+) {
+	salt := userlib.Hash([]byte("salt-" + username))
+
+	passwordRoot := userlib.Argon2Key([]byte(password), salt, 16)
+
+	encContent := []byte("account-enc" + accountUUID.String())
+	enc, err := userlib.HashKDF(passwordRoot, encContent)
+
+	if err != nil {
+		return nil, nil, err
+	}
+
+	macContent := []byte("account-mac" + accountUUID.String())
+	mac, err := userlib.HashKDF(passwordRoot, macContent)
+
+	if err != nil {
+		return nil, nil, err
+	}
+
+	encKey = enc[:16]
+	macKey = mac[:16]
+
+	return encKey, macKey, nil
+}
+
+//Construction of mac meesage
+func accountMACMessage(accountUUID uuid.UUID, ciphertext []byte) []byte {
+	prefix := []byte(
+		"authenticated-account:" + accountUUID.String() + ":",
+	)
+	message := make([]byte, 0, len(prefix)+len(ciphertext))
+	message = append(message, prefix...)
+	message = append(message, ciphertext...)
+	return message
+}
+
+//Encrypt then MAC
+func emacAccount(
+	account Account, accountUUID uuid.UUID, encKey []byte, macKey []byte,
+) ([]byte, error) {
+	if len(encKey) != 16 || len(macKey) != 16 {
+		return nil, errors.New("invalid account key length")
+	}
+
+	accountBytes, err := json.Marshal(account)
+	if err != nil {
+		return nil, err
+	}
+	//initialized vector
+	iv := userlib.RandomBytes(16)
+	ciphertext := userlib.SymEnc(encKey, iv, accountBytes)
+
+	macMessage := accountMACMessage(accountUUID, ciphertext)
+	mac, err := userlib.HMACEval(macKey, macMessage)
+
+	if err != nil {
+		return nil, err
+	}
+
+	envelope := AuthenticatedEnvelope{
+		Ciphertext: ciphertext,
+		MAC:        mac,
+	}
+
+	//JSON marshal
+	envelopeBytes, err := json.Marshal(envelope)
+	if err != nil {
+		return nil, err
+	}
+
+	return envelopeBytes, nil
+}
+
 // NOTE: The following methods have toy (insecure!) implementations.
 
 func InitUser(username string, password string) (userdataptr *User, err error) {
-	var userdata User
-	userdata.Username = username
+	if username == "" {
+		return nil, errors.New("username cannot be empty")
+	}
+
+	accountUUID, err := getUserUUID(username)
+
+	if err != nil {
+		return nil, err
+	}
+
+	if isUsernameTaken(username, accountUUID) {
+		return nil, errors.New("username already exits")
+	}
+
+	//For receiveing enc invites
+	pkePulic, pkePrivate, err := userlib.PKEKeyGen()
+
+	if err != nil {
+		return nil, err
+	}
+
+	//Sign ds for the invites
+	signPrivate, verifyPublic, err := userlib.DSKeyGen()
+	if err != nil {
+		return nil, err
+	}
+
+	namespaceRoot := userlib.RandomBytes(16)
+
+	//Create the account for the user
+	account := Account{
+		UsernameHash:  userlib.Hash([]byte(username)),
+		NamespaceRoot: namespaceRoot,
+		PKEPrivate:    pkePrivate,
+		SignPrivate:   signPrivate,
+	}
+
+	accountEncKey, accountMACKey, err := deriveAccountKey(
+		username,
+		password,
+		accountUUID,
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	encAccount, err := emacAccount(
+		account,
+		accountUUID,
+		accountEncKey,
+		accountMACKey,
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	//Store the key for dec
+	err = userlib.KeystoreSet(
+		getPKEKeyName(username),
+		pkePulic,
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	//Store the key for verify the d.s.
+	err = userlib.KeystoreSet(
+		getVerifyKeyName(username),
+		verifyPublic,
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	//Store the emac account to datastore
+	userlib.DatastoreSet(accountUUID, encAccount)
+
+	userdata := User{
+		Username:      username,
+		NamespaceRoot: namespaceRoot,
+		PKEPrivate:    pkePrivate,
+		SignPrivate:   signPrivate,
+	}
+
 	return &userdata, nil
 }
 
