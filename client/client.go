@@ -180,7 +180,7 @@ func isUsernameTaken(username string, accountUUID uuid.UUID) bool {
 func deriveAccountKey(username string, password string, accountUUID uuid.UUID) (
 	encKey []byte, macKey []byte, err error,
 ) {
-	salt := userlib.Hash([]byte("salt-" + username))
+	salt := userlib.Hash([]byte("password-salt-" + username))
 
 	passwordRoot := userlib.Argon2Key([]byte(password), salt, 16)
 
@@ -346,10 +346,143 @@ func InitUser(username string, password string) (userdataptr *User, err error) {
 	return &userdata, nil
 }
 
+ /** 
+ Helper Method for GetUser
+ **/
+// func isKeyPairMatched(
+// 	privateKey userlib.PrivateKeyType,
+// 	publicKey userlib.PublicKeyType,
+// 	expectedKeyType string,
+// ) bool {
+// 	if privateKey.KeyType != expectedKeyType {
+// 		return false
+// 	}
+
+// 	if publicKey.KeyType != expectedKeyType {
+// 		return false
+// 	}
+
+// 	privatePublic := privateKey.PrivKey.PublicKey
+// 	publicPublic := publicKey.PubKey
+
+// 	if privatePublic.N == nil || publicPublic.N == nil {
+// 		return false
+// 	}
+
+// 	if privatePublic.E != publicPublic.E {
+// 		return false
+// 	}
+
+// 	return privatePublic.N.Cmp(publicPublic.N) == 0
+// }
+
+//MAC then decrypt the account then open the account
+func openAccount(
+	envelopeBytes []byte,
+	accountUUID uuid.UUID,
+	encKey []byte,
+	macKey []byte,
+) (Account, error) {
+	var emptyAccount Account
+
+	//Check the length
+	if len(encKey) != symmetricKeySize {
+		return emptyAccount, errors.New("invalid account encryption key")
+	}
+
+	if len(macKey) != symmetricKeySize {
+        return emptyAccount, errors.New("invalid account MAC key")
+    }
+
+	var envelope AuthenticatedEnvelope
+	err := json.Unmarshal(envelopeBytes, &envelope)
+	//Checking whether the envelope is valid or not
+	if err != nil {
+        return emptyAccount, errors.New("invalid account envelope")
+    }
+
+	if len(envelope.MAC) != userlib.HashSizeBytes {
+		return emptyAccount, errors.New("Invalid account MAC length")
+	}
+
+	//Get the expected mac based on the ciphertext
+	expectedMAC, err := userlib.HMACEval(
+		macKey,
+		accountMACMessage(accountUUID, envelope.Ciphertext),
+	)
+
+	if err != nil {
+		return emptyAccount, err
+	}
+
+	//If the mac failed, lowkey end of the world
+	if !userlib.HMACEqual(expectedMAC, envelope.MAC) {
+		return emptyAccount, errors.New("account authentication failed")
+	}
+
+	//Not for security check, but for too short c.t. that will panic the system
+	if len(envelope.Ciphertext) < userlib.AESBlockSizeBytes {
+		return emptyAccount, errors.New("account ciphertext is too short")
+	}
+
+	plaintext := userlib.SymDec(encKey, envelope.Ciphertext,)
+
+	var account Account
+	err = json.Unmarshal(plaintext, &account)
+	if err != nil {
+        return emptyAccount, errors.New("invalid account plaintext")
+    }
+
+    return account, nil
+}
+
 func GetUser(username string, password string) (userdataptr *User, err error) {
-	var userdata User
-	userdataptr = &userdata
-	return userdataptr, nil
+	if username == "" {
+		return nil, errors.New("username cant be empty")
+	}
+
+	accountUUID, err := getUserUUID(username)
+    if err != nil {
+        return nil, err
+    }
+
+	//Get the envelope
+	envelopeBytes, exists := userlib.DatastoreGet(accountUUID)
+
+	if !exists {
+		return nil, errors.New("user account does not exits")
+	}
+
+	//Derive the account enc and mac key based on username and password and uuid
+	accountEncKey, accountMACKey, err := deriveAccountKey(
+		username,
+		password,
+		accountUUID,
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	account, err := openAccount(
+		envelopeBytes,
+		accountUUID,
+		accountEncKey,
+		accountMACKey,
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	userdata := User{
+		Username: username,
+		NamespaceRoot: account.NamespaceRoot,
+		PKEPrivate: account.PKEPrivate,
+		SignPrivate: account.SignPrivate,
+	}
+
+	return &userdata, nil
 }
 
 func (userdata *User) StoreFile(filename string, content []byte) (err error) {

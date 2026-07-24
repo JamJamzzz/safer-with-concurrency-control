@@ -336,4 +336,236 @@ var _ = Describe("Client Tests", func() {
         	Expect(user).ToNot(BeNil())
     	})
 	})
+
+	Describe("GetUser Integration Tests", func() {
+    	Specify("logs in with the correct username and password", func() {
+        	initializedUser, err := client.InitUser("alice", "password")
+        	Expect(err).To(BeNil())
+        	Expect(initializedUser).ToNot(BeNil())
+
+        	loggedInUser, err := client.GetUser("alice", "password")
+
+        	Expect(err).To(BeNil())
+        	Expect(loggedInUser).ToNot(BeNil())
+    	})
+
+    	Specify("rejects a nonexistent username", func() {
+        	user, err := client.GetUser("alice", "password")
+
+        	Expect(err).ToNot(BeNil())
+        	Expect(user).To(BeNil())
+    	})
+
+    	Specify("rejects an empty username", func() {
+        	user, err := client.GetUser("", "password")
+
+        	Expect(err).ToNot(BeNil())
+        	Expect(user).To(BeNil())
+    	})
+
+    	Specify("rejects an incorrect password", func() {
+        	_, err := client.InitUser("alice", "correct-password")
+        	Expect(err).To(BeNil())
+
+        	user, err := client.GetUser("alice", "wrong-password")
+
+       	 Expect(err).ToNot(BeNil())
+        	Expect(user).To(BeNil())
+    	})
+
+    	Specify("accepts the correct empty password", func() {
+        	_, err := client.InitUser("alice", "")
+        	Expect(err).To(BeNil())
+
+        	user, err := client.GetUser("alice", "")
+
+        	Expect(err).To(BeNil())
+        	Expect(user).ToNot(BeNil())
+   		})
+
+    	Specify("rejects a nonempty password for an empty-password account", func() {
+        	_, err := client.InitUser("alice", "")
+        	Expect(err).To(BeNil())
+
+        	user, err := client.GetUser("alice", "password")
+
+        	Expect(err).ToNot(BeNil())
+        	Expect(user).To(BeNil())
+    	})
+
+    	Specify("treats passwords as exact and case-sensitive", func() {
+        	_, err := client.InitUser("alice", "Password")
+        	Expect(err).To(BeNil())
+
+        	lowercaseAttempt, err := client.GetUser("alice", "password")
+        	Expect(err).ToNot(BeNil())
+        	Expect(lowercaseAttempt).To(BeNil())
+
+        	correctAttempt, err := client.GetUser("alice", "Password")
+        	Expect(err).To(BeNil())
+        	Expect(correctAttempt).ToNot(BeNil())
+    	})
+
+    	Specify("treats whitespace as part of the password", func() {
+        	_, err := client.InitUser("alice", " password ")
+        	Expect(err).To(BeNil())
+
+        	noWhitespace, err := client.GetUser("alice", "password")
+        	Expect(err).ToNot(BeNil())
+        	Expect(noWhitespace).To(BeNil())
+
+        	exactPassword, err := client.GetUser("alice", " password ")
+        	Expect(err).To(BeNil())
+        	Expect(exactPassword).ToNot(BeNil())
+    	})
+
+    	Specify("treats usernames as case-sensitive", func() {
+       		_, err := client.InitUser("Alice", "password")
+        	Expect(err).To(BeNil())
+
+        	wrongCase, err := client.GetUser("alice", "password")
+        	Expect(err).ToNot(BeNil())
+        	Expect(wrongCase).To(BeNil())
+
+        	correctCase, err := client.GetUser("Alice", "password")
+       	 	Expect(err).To(BeNil())
+        	Expect(correctCase).ToNot(BeNil())
+    	})
+
+    	Specify("supports punctuation in usernames", func() {
+        	username := "alice-test@example.com"
+
+        	_, err := client.InitUser(username, "password")
+        	Expect(err).To(BeNil())
+
+        	user, err := client.GetUser(username, "password")
+
+        	Expect(err).To(BeNil())
+        	Expect(user).ToNot(BeNil())
+    	})
+
+    	Specify("supports multiple sessions for the same account", func() {
+        	firstSession, err := client.InitUser("alice", "password")
+        	Expect(err).To(BeNil())
+        	Expect(firstSession).ToNot(BeNil())
+
+        	secondSession, err := client.GetUser("alice", "password")
+        	Expect(err).To(BeNil())
+        	Expect(secondSession).ToNot(BeNil())
+
+        	thirdSession, err := client.GetUser("alice", "password")
+        	Expect(err).To(BeNil())
+        	Expect(thirdSession).ToNot(BeNil())
+    	})
+
+    	Specify("supports different users with the same password", func() {
+        	_, err := client.InitUser("alice", "shared-password")
+        	Expect(err).To(BeNil())
+
+        	_, err = client.InitUser("bob", "shared-password")
+        	Expect(err).To(BeNil())
+
+        	aliceSession, err := client.GetUser("alice", "shared-password")
+        	Expect(err).To(BeNil())
+        	Expect(aliceSession).ToNot(BeNil())
+
+        	bobSession, err := client.GetUser("bob", "shared-password")
+        	Expect(err).To(BeNil())
+        	Expect(bobSession).ToNot(BeNil())
+    	})
+
+   	 	Specify("wrong-password attempts do not damage the account", func() {
+        	_, err := client.InitUser("alice", "correct-password")
+        	Expect(err).To(BeNil())
+
+        	failedSession, err := client.GetUser("alice", "wrong-password")
+        	Expect(err).ToNot(BeNil())
+        	Expect(failedSession).To(BeNil())
+
+        	validSession, err := client.GetUser("alice", "correct-password")
+        	Expect(err).To(BeNil())
+        	Expect(validSession).ToNot(BeNil())
+    	})
+
+    	Specify("duplicate registration failure does not damage login", func() {
+        	_, err := client.InitUser("alice", "correct-password")
+        	Expect(err).To(BeNil())
+
+        	duplicate, err := client.InitUser("alice", "other-password")
+        	Expect(err).ToNot(BeNil())
+        	Expect(duplicate).To(BeNil())
+
+        	originalUser, err := client.GetUser("alice", "correct-password")
+        	Expect(err).To(BeNil())
+        	Expect(originalUser).ToNot(BeNil())
+    	})
+
+		Specify("rejects truncated persistent account data", func() {
+    		_, err := client.InitUser("alice", "password")
+    		Expect(err).To(BeNil())
+
+    		truncatedSomething := false
+
+    		for objectUUID, objectData := range userlib.DatastoreGetMap() {
+        		if len(objectData) < 2 {
+            		continue
+        		}
+
+        		truncatedData := append(
+           			[]byte(nil),
+            		objectData[:len(objectData)/2]...,
+        		)
+
+        		userlib.DatastoreSet(objectUUID, truncatedData)
+        		truncatedSomething = true
+    		}
+
+    		Expect(truncatedSomething).To(BeTrue())
+
+    		user, err := client.GetUser("alice", "password")
+
+    		Expect(err).ToNot(BeNil())
+    		Expect(user).To(BeNil())
+		})
+
+		Specify("rejects swapping encrypted Accounts between users", func() {
+    		_, err := client.InitUser("alice", "alice-password")
+    		Expect(err).To(BeNil())
+
+    		_, err = client.InitUser("bob", "bob-password")
+    		Expect(err).To(BeNil())
+
+    		var objectUUIDs []userlib.UUID
+    		var objectData [][]byte
+
+    		for objectUUID, data := range userlib.DatastoreGetMap() {
+        		objectUUIDs = append(objectUUIDs, objectUUID)
+        		objectData = append(
+            		objectData,
+            		append([]byte(nil), data...),
+        		)
+    		}
+
+    		//Only one permanent user account 
+    		Expect(objectUUIDs).To(HaveLen(2))
+    		Expect(objectData).To(HaveLen(2))
+
+    		userlib.DatastoreSet(objectUUIDs[0], objectData[1])
+    		userlib.DatastoreSet(objectUUIDs[1], objectData[0])
+
+    		aliceSession, aliceErr := client.GetUser(
+        		"alice",
+        		"alice-password",
+    		)
+    		Expect(aliceErr).ToNot(BeNil())
+    		Expect(aliceSession).To(BeNil())
+
+    		bobSession, bobErr := client.GetUser(
+        		"bob",
+        		"bob-password",
+    		)
+    		Expect(bobErr).ToNot(BeNil())
+    		Expect(bobSession).To(BeNil())
+		})
+	})
 })
