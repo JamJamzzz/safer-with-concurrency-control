@@ -12,7 +12,7 @@ import (
 	_ "strings"
 	"testing"
 
-	_ "github.com/google/uuid"
+	"github.com/google/uuid"
 
 	// A "dot" import is used here so that the functions in the ginko and gomega
 	// modules can be used without an identifier. For example, Describe() and
@@ -568,4 +568,1191 @@ var _ = Describe("Client Tests", func() {
     		Expect(bobSession).To(BeNil())
 		})
 	})
+	Describe("StoreFile Integration Tests", func() {
+    	Specify("stores and loads a new file", func() {
+        	alice, err := client.InitUser("alice", "password")
+        	Expect(err).To(BeNil())
+
+        	err = alice.StoreFile(
+            	"file",
+            	[]byte("hello"),
+        	)
+        	Expect(err).To(BeNil())
+
+        	content, err := alice.LoadFile("file")
+        	Expect(err).To(BeNil())
+        	Expect(content).To(Equal([]byte("hello")))
+    	})
+
+    	Specify("supports an empty filename", func() {
+        	alice, err := client.InitUser("alice", "password")
+        	Expect(err).To(BeNil())
+
+        	err = alice.StoreFile("", []byte("hello"))
+        	Expect(err).To(BeNil())
+
+        	content, err := alice.LoadFile("")
+        	Expect(err).To(BeNil())
+        	Expect(content).To(Equal([]byte("hello")))
+    	})
+
+    	Specify("supports empty file content", func() {
+        	alice, err := client.InitUser("alice", "password")
+        	Expect(err).To(BeNil())
+
+        	err = alice.StoreFile("empty", []byte{})
+        	Expect(err).To(BeNil())
+
+        	content, err := alice.LoadFile("empty")
+        	Expect(err).To(BeNil())
+        	Expect(content).To(Equal([]byte{}))
+    	})
+
+    	Specify("overwrites an existing file", func() {
+        	alice, err := client.InitUser("alice", "password")
+        	Expect(err).To(BeNil())
+
+        	err = alice.StoreFile("file", []byte("old"))
+        	Expect(err).To(BeNil())
+
+        	err = alice.StoreFile("file", []byte("new"))
+        	Expect(err).To(BeNil())
+
+        	content, err := alice.LoadFile("file")
+        	Expect(err).To(BeNil())
+        	Expect(content).To(Equal([]byte("new")))
+    	})
+
+    	Specify("overwrites existing content with empty content", func() {
+        	alice, err := client.InitUser("alice", "password")
+        	Expect(err).To(BeNil())
+
+        	err = alice.StoreFile("file", []byte("old"))
+        	Expect(err).To(BeNil())
+
+        	err = alice.StoreFile("file", []byte{})
+        	Expect(err).To(BeNil())
+
+        	content, err := alice.LoadFile("file")
+        	Expect(err).To(BeNil())
+        	Expect(content).To(Equal([]byte{}))
+    	})
+
+    	Specify("keeps different local filenames independent", func() {
+        	alice, err := client.InitUser("alice", "password")
+        	Expect(err).To(BeNil())
+
+        	err = alice.StoreFile("first", []byte("one"))
+        	Expect(err).To(BeNil())
+
+        	err = alice.StoreFile("second", []byte("two"))
+        	Expect(err).To(BeNil())
+
+        	first, err := alice.LoadFile("first")
+        	Expect(err).To(BeNil())
+        	Expect(first).To(Equal([]byte("one")))
+
+        	second, err := alice.LoadFile("second")
+        	Expect(err).To(BeNil())
+        	Expect(second).To(Equal([]byte("two")))
+    	})
+
+    	Specify("makes stored files visible to another user session", func() {
+        	aliceDesktop, err := client.InitUser(
+            	"alice",
+            	"password",
+        	)
+        	Expect(err).To(BeNil())
+
+        	err = aliceDesktop.StoreFile(
+            	"file",
+            	[]byte("hello"),
+        	)
+        	Expect(err).To(BeNil())
+
+        	aliceLaptop, err := client.GetUser(
+            	"alice",
+            	"password",
+        	)
+        	Expect(err).To(BeNil())
+
+        	content, err := aliceLaptop.LoadFile("file")
+        	Expect(err).To(BeNil())
+        	Expect(content).To(Equal([]byte("hello")))
+    	})
+	})
+	Describe("AppendToFile Integration Tests", func() {
+    	Specify("appends content to a file", func() {
+        	alice, err := client.InitUser("alice", "password")
+        	Expect(err).To(BeNil())
+
+        	err = alice.StoreFile("file", []byte("hello"))
+        	Expect(err).To(BeNil())
+
+        	err = alice.AppendToFile("file", []byte(" world"))
+        	Expect(err).To(BeNil())
+
+        	content, err := alice.LoadFile("file")
+        	Expect(err).To(BeNil())
+        	Expect(content).To(Equal([]byte("hello world")))
+    	})
+
+    	Specify("preserves the order of multiple appends", func() {
+        	alice, err := client.InitUser("alice", "password")
+        	Expect(err).To(BeNil())
+
+        	err = alice.StoreFile("file", []byte("A"))
+        	Expect(err).To(BeNil())
+
+        	err = alice.AppendToFile("file", []byte("B"))
+        	Expect(err).To(BeNil())
+
+        	err = alice.AppendToFile("file", []byte("C"))
+        	Expect(err).To(BeNil())
+
+        	err = alice.AppendToFile("file", []byte("D"))
+        	Expect(err).To(BeNil())
+
+        	content, err := alice.LoadFile("file")
+        	Expect(err).To(BeNil())
+        	Expect(content).To(Equal([]byte("ABCD")))
+    	})
+
+    	Specify("appends to an initially empty file", func() {
+        	alice, err := client.InitUser("alice", "password")
+        	Expect(err).To(BeNil())
+
+        	err = alice.StoreFile("file", []byte{})
+        	Expect(err).To(BeNil())
+
+        	err = alice.AppendToFile("file", []byte("content"))
+        	Expect(err).To(BeNil())
+
+        	content, err := alice.LoadFile("file")
+        	Expect(err).To(BeNil())
+        	Expect(content).To(Equal([]byte("content")))
+    	})
+
+    	Specify("supports an empty filename", func() {
+        	alice, err := client.InitUser("alice", "password")
+        	Expect(err).To(BeNil())
+
+        	err = alice.StoreFile("", []byte("A"))
+        	Expect(err).To(BeNil())
+
+        	err = alice.AppendToFile("", []byte("B"))
+        	Expect(err).To(BeNil())
+
+        	content, err := alice.LoadFile("")
+        	Expect(err).To(BeNil())
+        	Expect(content).To(Equal([]byte("AB")))
+    	})
+
+    	Specify("treats an empty append as a successful no-op", func() {
+        	alice, err := client.InitUser("alice", "password")
+        	Expect(err).To(BeNil())
+
+        	err = alice.StoreFile("file", []byte("original"))
+        	Expect(err).To(BeNil())
+
+        	err = alice.AppendToFile("file", []byte{})
+        	Expect(err).To(BeNil())
+
+        	content, err := alice.LoadFile("file")
+        	Expect(err).To(BeNil())
+        	Expect(content).To(Equal([]byte("original")))
+    	})
+
+    	Specify("rejects append to a nonexistent file", func() {
+        	alice, err := client.InitUser("alice", "password")
+        	Expect(err).To(BeNil())
+
+        	err = alice.AppendToFile(
+            	"missing",
+            	[]byte("content"),
+        	)
+
+        	Expect(err).ToNot(BeNil())
+    	})
+
+    	Specify("makes appends visible across sessions", func() {
+        	aliceDesktop, err := client.InitUser(
+            	"alice",
+            	"password",
+        	)
+        	Expect(err).To(BeNil())
+
+        	err = aliceDesktop.StoreFile(
+            	"file",
+            	[]byte("A"),
+        	)
+        	Expect(err).To(BeNil())
+
+        	aliceLaptop, err := client.GetUser(
+            	"alice",
+            	"password",
+        	)
+        	Expect(err).To(BeNil())
+
+        	err = aliceLaptop.AppendToFile(
+            	"file",
+            	[]byte("B"),
+        	)
+        	Expect(err).To(BeNil())
+
+        	content, err := aliceDesktop.LoadFile("file")
+        	Expect(err).To(BeNil())
+        	Expect(content).To(Equal([]byte("AB")))
+    	})
+
+    	Specify("works after a file overwrite", func() {
+        	alice, err := client.InitUser("alice", "password")
+        	Expect(err).To(BeNil())
+
+        	err = alice.StoreFile("file", []byte("old"))
+        	Expect(err).To(BeNil())
+
+        	err = alice.AppendToFile("file", []byte("-append"))
+        	Expect(err).To(BeNil())
+
+        	err = alice.StoreFile("file", []byte("new"))
+        	Expect(err).To(BeNil())
+
+        	err = alice.AppendToFile("file", []byte("-final"))
+        	Expect(err).To(BeNil())
+
+        	content, err := alice.LoadFile("file")
+        	Expect(err).To(BeNil())
+        	Expect(content).To(Equal([]byte("new-final")))
+    	})
+
+    	Specify("supports a large append", func() {
+        	alice, err := client.InitUser("alice", "password")
+        	Expect(err).To(BeNil())
+
+        	err = alice.StoreFile("file", []byte("prefix"))
+        	Expect(err).To(BeNil())
+
+        	largeAppend := make([]byte, 100000)
+        	for index := range largeAppend {
+            	largeAppend[index] = byte('x')
+        	}
+
+        	err = alice.AppendToFile("file", largeAppend)
+        	Expect(err).To(BeNil())
+
+        	expected := append(
+            	[]byte("prefix"),
+            	largeAppend...,
+        	)
+
+        	content, err := alice.LoadFile("file")
+        	Expect(err).To(BeNil())
+       	 	Expect(content).To(Equal(expected))
+    	})
+	})
+
+	Specify("append bandwidth is independent of existing file size", func() {
+    	alice, err := client.InitUser("alice", "password")
+    	Expect(err).To(BeNil())
+
+    	err = alice.StoreFile("small", []byte("x"))
+    	Expect(err).To(BeNil())
+
+    	largeInitialContent := make([]byte, 100000)
+    	err = alice.StoreFile("large", largeInitialContent)
+    	Expect(err).To(BeNil())
+
+    	userlib.DatastoreResetBandwidth()
+
+    	err = alice.AppendToFile("small", []byte("z"))
+    	Expect(err).To(BeNil())
+
+    	smallFileBandwidth := userlib.DatastoreGetBandwidth()
+
+    	userlib.DatastoreResetBandwidth()
+
+    	err = alice.AppendToFile("large", []byte("z"))
+    	Expect(err).To(BeNil())
+
+    	largeFileBandwidth := userlib.DatastoreGetBandwidth()
+
+    	Expect(largeFileBandwidth).To(Equal(smallFileBandwidth))
+	})
+
+	Describe("LoadFile Integration Tests", func() {
+    Specify("loads content stored in a file", func() {
+        alice, err := client.InitUser("alice", "password")
+        Expect(err).To(BeNil())
+
+        err = alice.StoreFile(
+            "file",
+            []byte("hello world"),
+        )
+        Expect(err).To(BeNil())
+
+        content, err := alice.LoadFile("file")
+
+        Expect(err).To(BeNil())
+        Expect(content).To(Equal([]byte("hello world")))
+    })
+
+    Specify("loads an empty file", func() {
+        alice, err := client.InitUser("alice", "password")
+        Expect(err).To(BeNil())
+
+        err = alice.StoreFile("file", []byte{})
+        Expect(err).To(BeNil())
+
+        content, err := alice.LoadFile("file")
+
+        Expect(err).To(BeNil())
+        Expect(content).To(Equal([]byte{}))
+    })
+
+    Specify("supports an empty filename", func() {
+        alice, err := client.InitUser("alice", "password")
+        Expect(err).To(BeNil())
+
+        err = alice.StoreFile("", []byte("content"))
+        Expect(err).To(BeNil())
+
+        content, err := alice.LoadFile("")
+
+        Expect(err).To(BeNil())
+        Expect(content).To(Equal([]byte("content")))
+    })
+
+    Specify("returns an error for a nonexistent filename", func() {
+        alice, err := client.InitUser("alice", "password")
+        Expect(err).To(BeNil())
+
+        content, err := alice.LoadFile("missing")
+
+        Expect(err).ToNot(BeNil())
+        Expect(content).To(BeNil())
+    })
+
+    Specify("treats filenames as case-sensitive", func() {
+        alice, err := client.InitUser("alice", "password")
+        Expect(err).To(BeNil())
+
+        err = alice.StoreFile("File", []byte("content"))
+        Expect(err).To(BeNil())
+
+        wrongCase, err := alice.LoadFile("file")
+        Expect(err).ToNot(BeNil())
+        Expect(wrongCase).To(BeNil())
+
+        correctCase, err := alice.LoadFile("File")
+        Expect(err).To(BeNil())
+        Expect(correctCase).To(Equal([]byte("content")))
+    })
+
+    Specify("keeps different filenames independent", func() {
+        alice, err := client.InitUser("alice", "password")
+        Expect(err).To(BeNil())
+
+        err = alice.StoreFile("first", []byte("one"))
+        Expect(err).To(BeNil())
+
+        err = alice.StoreFile("second", []byte("two"))
+        Expect(err).To(BeNil())
+
+        first, err := alice.LoadFile("first")
+        Expect(err).To(BeNil())
+        Expect(first).To(Equal([]byte("one")))
+
+        second, err := alice.LoadFile("second")
+        Expect(err).To(BeNil())
+        Expect(second).To(Equal([]byte("two")))
+    })
+
+    Specify("keeps different users' namespaces independent", func() {
+        alice, err := client.InitUser("alice", "password")
+        Expect(err).To(BeNil())
+
+        bob, err := client.InitUser("bob", "password")
+        Expect(err).To(BeNil())
+
+        err = alice.StoreFile(
+            "same-name",
+            []byte("alice content"),
+        )
+        Expect(err).To(BeNil())
+
+        err = bob.StoreFile(
+            "same-name",
+            []byte("bob content"),
+        )
+        Expect(err).To(BeNil())
+
+        aliceContent, err := alice.LoadFile("same-name")
+        Expect(err).To(BeNil())
+        Expect(aliceContent).To(
+            Equal([]byte("alice content")),
+        )
+
+        bobContent, err := bob.LoadFile("same-name")
+        Expect(err).To(BeNil())
+        Expect(bobContent).To(
+            Equal([]byte("bob content")),
+        )
+    })
+
+    Specify("loads the latest overwritten content", func() {
+        alice, err := client.InitUser("alice", "password")
+        Expect(err).To(BeNil())
+
+        err = alice.StoreFile("file", []byte("first"))
+        Expect(err).To(BeNil())
+
+        err = alice.StoreFile("file", []byte("second"))
+        Expect(err).To(BeNil())
+
+        err = alice.StoreFile("file", []byte("third"))
+        Expect(err).To(BeNil())
+
+        content, err := alice.LoadFile("file")
+
+        Expect(err).To(BeNil())
+        Expect(content).To(Equal([]byte("third")))
+    })
+
+    Specify("concatenates all chunks in the correct order", func() {
+        alice, err := client.InitUser("alice", "password")
+        Expect(err).To(BeNil())
+
+        err = alice.StoreFile("file", []byte("A"))
+        Expect(err).To(BeNil())
+
+        err = alice.AppendToFile("file", []byte("B"))
+        Expect(err).To(BeNil())
+
+        err = alice.AppendToFile("file", []byte("C"))
+        Expect(err).To(BeNil())
+
+        err = alice.AppendToFile("file", []byte("D"))
+        Expect(err).To(BeNil())
+
+        content, err := alice.LoadFile("file")
+
+        Expect(err).To(BeNil())
+        Expect(content).To(Equal([]byte("ABCD")))
+    })
+
+    Specify("loads a file after many appends", func() {
+        alice, err := client.InitUser("alice", "password")
+        Expect(err).To(BeNil())
+
+        err = alice.StoreFile("file", []byte("start"))
+        Expect(err).To(BeNil())
+
+        expected := []byte("start")
+
+        for index := 0; index < 100; index++ {
+            appendContent := []byte{byte(index)}
+
+            err = alice.AppendToFile(
+                "file",
+                appendContent,
+            )
+            Expect(err).To(BeNil())
+
+            expected = append(
+                expected,
+                appendContent...,
+            )
+        }
+
+        content, err := alice.LoadFile("file")
+
+        Expect(err).To(BeNil())
+        Expect(content).To(Equal(expected))
+    })
+
+    Specify("supports binary file content", func() {
+        alice, err := client.InitUser("alice", "password")
+        Expect(err).To(BeNil())
+
+        binaryContent := []byte{
+            0,
+            1,
+            2,
+            3,
+            0,
+            127,
+            128,
+            254,
+            255,
+        }
+
+        err = alice.StoreFile("binary", binaryContent)
+        Expect(err).To(BeNil())
+
+        content, err := alice.LoadFile("binary")
+
+        Expect(err).To(BeNil())
+        Expect(content).To(Equal(binaryContent))
+    })
+
+    Specify("supports large file content", func() {
+        alice, err := client.InitUser("alice", "password")
+        Expect(err).To(BeNil())
+
+        largeContent := make([]byte, 100000)
+
+        for index := range largeContent {
+            largeContent[index] = byte(index % 256)
+        }
+
+        err = alice.StoreFile("large", largeContent)
+        Expect(err).To(BeNil())
+
+        content, err := alice.LoadFile("large")
+
+        Expect(err).To(BeNil())
+        Expect(content).To(Equal(largeContent))
+    })
+
+    Specify("returns the same content on repeated loads", func() {
+        alice, err := client.InitUser("alice", "password")
+        Expect(err).To(BeNil())
+
+        expected := []byte("unchanged content")
+
+        err = alice.StoreFile("file", expected)
+        Expect(err).To(BeNil())
+
+        for attempt := 0; attempt < 5; attempt++ {
+            content, err := alice.LoadFile("file")
+
+            Expect(err).To(BeNil())
+            Expect(content).To(Equal(expected))
+        }
+    })
+
+    Specify("loads files across multiple user sessions", func() {
+        aliceDesktop, err := client.InitUser(
+            "alice",
+            "password",
+        )
+        Expect(err).To(BeNil())
+
+        err = aliceDesktop.StoreFile(
+            "file",
+            []byte("desktop content"),
+        )
+        Expect(err).To(BeNil())
+
+        aliceLaptop, err := client.GetUser(
+            "alice",
+            "password",
+        )
+        Expect(err).To(BeNil())
+
+        content, err := aliceLaptop.LoadFile("file")
+
+        Expect(err).To(BeNil())
+        Expect(content).To(
+            Equal([]byte("desktop content")),
+        )
+    })
+
+    Specify("failed load does not damage another valid file", func() {
+        alice, err := client.InitUser("alice", "password")
+        Expect(err).To(BeNil())
+
+        err = alice.StoreFile(
+            "valid",
+            []byte("valid content"),
+        )
+        Expect(err).To(BeNil())
+
+        _, err = alice.LoadFile("missing")
+        Expect(err).ToNot(BeNil())
+
+        content, err := alice.LoadFile("valid")
+
+        Expect(err).To(BeNil())
+        Expect(content).To(
+            Equal([]byte("valid content")),
+        )
+    })
+})
+	Specify("fails safely when required file objects are deleted", func() {
+    alice, err := client.InitUser("alice", "password")
+    Expect(err).To(BeNil())
+
+    err = alice.StoreFile("file", []byte("content"))
+    Expect(err).To(BeNil())
+
+    for objectUUID := range userlib.DatastoreGetMap() {
+        userlib.DatastoreDelete(objectUUID)
+    }
+
+    content, err := alice.LoadFile("file")
+
+    Expect(err).ToNot(BeNil())
+    Expect(content).To(BeNil())
+})
+
+	Specify("fails safely on malformed datastore objects", func() {
+    alice, err := client.InitUser("alice", "password")
+    Expect(err).To(BeNil())
+
+    err = alice.StoreFile("file", []byte("content"))
+    Expect(err).To(BeNil())
+
+    for objectUUID := range userlib.DatastoreGetMap() {
+        userlib.DatastoreSet(
+            objectUUID,
+            []byte("malformed data"),
+        )
+    }
+
+    content, err := alice.LoadFile("file")
+
+    Expect(err).ToNot(BeNil())
+    Expect(content).To(BeNil())
+})
+
+	Specify("detects modified datastore objects", func() {
+    alice, err := client.InitUser("alice", "password")
+    Expect(err).To(BeNil())
+
+    err = alice.StoreFile("file", []byte("content"))
+    Expect(err).To(BeNil())
+
+    err = alice.AppendToFile("file", []byte("append"))
+    Expect(err).To(BeNil())
+
+    changedSomething := false
+
+    for objectUUID, objectData :=
+        range userlib.DatastoreGetMap() {
+
+        if len(objectData) == 0 {
+            continue
+        }
+
+        modifiedData := append([]byte(nil), objectData...)
+        modifiedData[len(modifiedData)/2] ^= 1
+
+        userlib.DatastoreSet(
+            objectUUID,
+            modifiedData,
+        )
+
+        changedSomething = true
+    }
+
+    Expect(changedSomething).To(BeTrue())
+
+    content, err := alice.LoadFile("file")
+
+    Expect(err).ToNot(BeNil())
+    Expect(content).To(BeNil())
+})
+
+Specify("detects truncated datastore objects", func() {
+    alice, err := client.InitUser("alice", "password")
+    Expect(err).To(BeNil())
+
+    err = alice.StoreFile("file", []byte("content"))
+    Expect(err).To(BeNil())
+
+    for objectUUID, objectData :=
+        range userlib.DatastoreGetMap() {
+
+        if len(objectData) < 2 {
+            userlib.DatastoreSet(
+                objectUUID,
+                []byte{},
+            )
+            continue
+        }
+
+        userlib.DatastoreSet(
+            objectUUID,
+            append(
+                []byte(nil),
+                objectData[:len(objectData)/2]...,
+            ),
+        )
+    }
+
+    content, err := alice.LoadFile("file")
+
+    Expect(err).ToNot(BeNil())
+    Expect(content).To(BeNil())
+})
+
+Describe("CreateInvitation Integration Tests", func() {
+    Specify("creates an invitation for an existing user", func() {
+        alice, err := client.InitUser("alice", "password")
+        Expect(err).To(BeNil())
+
+        _, err = client.InitUser("bob", "password")
+        Expect(err).To(BeNil())
+
+        err = alice.StoreFile("file", []byte("content"))
+        Expect(err).To(BeNil())
+
+        invitationPtr, err := alice.CreateInvitation(
+            "file",
+            "bob",
+        )
+
+        Expect(err).To(BeNil())
+        Expect(invitationPtr).ToNot(Equal(uuid.Nil))
+
+        _, exists := userlib.DatastoreGet(invitationPtr)
+        Expect(exists).To(BeTrue())
+    })
+
+    Specify("rejects sharing a nonexistent file", func() {
+        alice, err := client.InitUser("alice", "password")
+        Expect(err).To(BeNil())
+
+        _, err = client.InitUser("bob", "password")
+        Expect(err).To(BeNil())
+
+        invitationPtr, err := alice.CreateInvitation(
+            "missing",
+            "bob",
+        )
+
+        Expect(err).ToNot(BeNil())
+        Expect(invitationPtr).To(Equal(uuid.Nil))
+    })
+
+    Specify("rejects a nonexistent recipient", func() {
+        alice, err := client.InitUser("alice", "password")
+        Expect(err).To(BeNil())
+
+        err = alice.StoreFile("file", []byte("content"))
+        Expect(err).To(BeNil())
+
+        invitationPtr, err := alice.CreateInvitation(
+            "file",
+            "missing-user",
+        )
+
+        Expect(err).ToNot(BeNil())
+        Expect(invitationPtr).To(Equal(uuid.Nil))
+    })
+})
+Describe("AcceptInvitation Integration Tests", func() {
+    Specify("accepts an owner invitation", func() {
+        alice, err := client.InitUser("alice", "password")
+        Expect(err).To(BeNil())
+
+        bob, err := client.InitUser("bob", "password")
+        Expect(err).To(BeNil())
+
+        err = alice.StoreFile("alice-file", []byte("content"))
+        Expect(err).To(BeNil())
+
+        invitation, err := alice.CreateInvitation(
+            "alice-file",
+            "bob",
+        )
+        Expect(err).To(BeNil())
+
+        err = bob.AcceptInvitation(
+            "alice",
+            invitation,
+            "bob-file",
+        )
+        Expect(err).To(BeNil())
+
+        content, err := bob.LoadFile("bob-file")
+        Expect(err).To(BeNil())
+        Expect(content).To(Equal([]byte("content")))
+    })
+
+    Specify("allows recipient to choose a different filename", func() {
+        alice, err := client.InitUser("alice", "password")
+        Expect(err).To(BeNil())
+
+        bob, err := client.InitUser("bob", "password")
+        Expect(err).To(BeNil())
+
+        err = alice.StoreFile(
+            "secret-report",
+            []byte("report"),
+        )
+        Expect(err).To(BeNil())
+
+        invitation, err := alice.CreateInvitation(
+            "secret-report",
+            "bob",
+        )
+        Expect(err).To(BeNil())
+
+        err = bob.AcceptInvitation(
+            "alice",
+            invitation,
+            "vacation-photo",
+        )
+        Expect(err).To(BeNil())
+
+        content, err := bob.LoadFile(
+            "vacation-photo",
+        )
+        Expect(err).To(BeNil())
+        Expect(content).To(Equal([]byte("report")))
+    })
+
+    Specify("shares one live copy of the file", func() {
+        alice, err := client.InitUser("alice", "password")
+        Expect(err).To(BeNil())
+
+        bob, err := client.InitUser("bob", "password")
+        Expect(err).To(BeNil())
+
+        err = alice.StoreFile("a", []byte("A"))
+        Expect(err).To(BeNil())
+
+        invitation, err := alice.CreateInvitation("a", "bob")
+        Expect(err).To(BeNil())
+
+        err = bob.AcceptInvitation("alice", invitation, "b")
+        Expect(err).To(BeNil())
+
+        err = bob.AppendToFile("b", []byte("B"))
+        Expect(err).To(BeNil())
+
+        aliceContent, err := alice.LoadFile("a")
+        Expect(err).To(BeNil())
+        Expect(aliceContent).To(Equal([]byte("AB")))
+
+        err = alice.StoreFile("a", []byte("new"))
+        Expect(err).To(BeNil())
+
+        bobContent, err := bob.LoadFile("b")
+        Expect(err).To(BeNil())
+        Expect(bobContent).To(Equal([]byte("new")))
+    })
+
+    Specify("supports non-owner resharing", func() {
+        alice, err := client.InitUser("alice", "password")
+        Expect(err).To(BeNil())
+
+        bob, err := client.InitUser("bob", "password")
+        Expect(err).To(BeNil())
+
+        charles, err := client.InitUser("charles", "password")
+        Expect(err).To(BeNil())
+
+        err = alice.StoreFile("a", []byte("content"))
+        Expect(err).To(BeNil())
+
+        aliceToBob, err := alice.CreateInvitation("a", "bob")
+        Expect(err).To(BeNil())
+
+        err = bob.AcceptInvitation(
+            "alice",
+            aliceToBob,
+            "b",
+        )
+        Expect(err).To(BeNil())
+
+        bobToCharles, err := bob.CreateInvitation(
+            "b",
+            "charles",
+        )
+        Expect(err).To(BeNil())
+
+        err = charles.AcceptInvitation(
+            "bob",
+            bobToCharles,
+            "c",
+        )
+        Expect(err).To(BeNil())
+
+        content, err := charles.LoadFile("c")
+        Expect(err).To(BeNil())
+        Expect(content).To(Equal([]byte("content")))
+    })
+
+    Specify("rejects an occupied local filename", func() {
+        alice, err := client.InitUser("alice", "password")
+        Expect(err).To(BeNil())
+
+        bob, err := client.InitUser("bob", "password")
+        Expect(err).To(BeNil())
+
+        err = alice.StoreFile("a", []byte("shared"))
+        Expect(err).To(BeNil())
+
+        err = bob.StoreFile("occupied", []byte("local"))
+        Expect(err).To(BeNil())
+
+        invitation, err := alice.CreateInvitation("a", "bob")
+        Expect(err).To(BeNil())
+
+        err = bob.AcceptInvitation(
+            "alice",
+            invitation,
+            "occupied",
+        )
+        Expect(err).ToNot(BeNil())
+
+        localContent, err := bob.LoadFile("occupied")
+        Expect(err).To(BeNil())
+        Expect(localContent).To(Equal([]byte("local")))
+    })
+
+    Specify("rejects a false sender username", func() {
+        alice, err := client.InitUser("alice", "password")
+        Expect(err).To(BeNil())
+
+        bob, err := client.InitUser("bob", "password")
+        Expect(err).To(BeNil())
+
+        _, err = client.InitUser("mallory", "password")
+        Expect(err).To(BeNil())
+
+        err = alice.StoreFile("a", []byte("content"))
+        Expect(err).To(BeNil())
+
+        invitation, err := alice.CreateInvitation("a", "bob")
+        Expect(err).To(BeNil())
+
+        err = bob.AcceptInvitation(
+            "mallory",
+            invitation,
+            "b",
+        )
+        Expect(err).ToNot(BeNil())
+    })
+
+    Specify("rejects invitation forwarding", func() {
+        alice, err := client.InitUser("alice", "password")
+        Expect(err).To(BeNil())
+
+        _, err = client.InitUser("bob", "password")
+        Expect(err).To(BeNil())
+
+        charles, err := client.InitUser("charles", "password")
+        Expect(err).To(BeNil())
+
+        err = alice.StoreFile("a", []byte("content"))
+        Expect(err).To(BeNil())
+
+        invitation, err := alice.CreateInvitation("a", "bob")
+        Expect(err).To(BeNil())
+
+        err = charles.AcceptInvitation(
+            "alice",
+            invitation,
+            "c",
+        )
+        Expect(err).ToNot(BeNil())
+    })
+})
+
+Describe("RevokeAccess Integration Tests", func() {
+    Specify("revokes a direct recipient and descendants", func() {
+        alice, err := client.InitUser("alice", "password")
+        Expect(err).To(BeNil())
+
+        bob, err := client.InitUser("bob", "password")
+        Expect(err).To(BeNil())
+
+        charles, err := client.InitUser("charles", "password")
+        Expect(err).To(BeNil())
+
+        err = alice.StoreFile("a", []byte("content"))
+        Expect(err).To(BeNil())
+
+        aliceToBob, err := alice.CreateInvitation("a", "bob")
+        Expect(err).To(BeNil())
+
+        err = bob.AcceptInvitation("alice", aliceToBob, "b")
+        Expect(err).To(BeNil())
+
+        bobToCharles, err := bob.CreateInvitation("b", "charles")
+        Expect(err).To(BeNil())
+
+        err = charles.AcceptInvitation(
+            "bob",
+            bobToCharles,
+            "c",
+        )
+        Expect(err).To(BeNil())
+
+        err = alice.RevokeAccess("a", "bob")
+        Expect(err).To(BeNil())
+
+        _, err = bob.LoadFile("b")
+        Expect(err).ToNot(BeNil())
+
+        _, err = charles.LoadFile("c")
+        Expect(err).ToNot(BeNil())
+
+        ownerContent, err := alice.LoadFile("a")
+        Expect(err).To(BeNil())
+        Expect(ownerContent).To(Equal([]byte("content")))
+    })
+
+    Specify("preserves other direct branches and descendants", func() {
+        alice, err := client.InitUser("alice", "password")
+        Expect(err).To(BeNil())
+
+        bob, err := client.InitUser("bob", "password")
+        Expect(err).To(BeNil())
+
+        charles, err := client.InitUser("charles", "password")
+        Expect(err).To(BeNil())
+
+        grace, err := client.InitUser("grace", "password")
+        Expect(err).To(BeNil())
+
+        err = alice.StoreFile("a", []byte("A"))
+        Expect(err).To(BeNil())
+
+        aliceToBob, err := alice.CreateInvitation("a", "bob")
+        Expect(err).To(BeNil())
+        Expect(bob.AcceptInvitation(
+            "alice",
+            aliceToBob,
+            "b",
+        )).To(BeNil())
+
+        aliceToCharles, err := alice.CreateInvitation(
+            "a",
+            "charles",
+        )
+        Expect(err).To(BeNil())
+        Expect(charles.AcceptInvitation(
+            "alice",
+            aliceToCharles,
+            "c",
+        )).To(BeNil())
+
+        charlesToGrace, err := charles.CreateInvitation(
+            "c",
+            "grace",
+        )
+        Expect(err).To(BeNil())
+        Expect(grace.AcceptInvitation(
+            "charles",
+            charlesToGrace,
+            "g",
+        )).To(BeNil())
+
+        err = alice.RevokeAccess("a", "bob")
+        Expect(err).To(BeNil())
+
+        _, err = bob.LoadFile("b")
+        Expect(err).ToNot(BeNil())
+
+        charlesContent, err := charles.LoadFile("c")
+        Expect(err).To(BeNil())
+        Expect(charlesContent).To(Equal([]byte("A")))
+
+        graceContent, err := grace.LoadFile("g")
+        Expect(err).To(BeNil())
+        Expect(graceContent).To(Equal([]byte("A")))
+
+        err = grace.AppendToFile("g", []byte("B"))
+        Expect(err).To(BeNil())
+
+        ownerContent, err := alice.LoadFile("a")
+        Expect(err).To(BeNil())
+        Expect(ownerContent).To(Equal([]byte("AB")))
+    })
+
+    Specify("preserves appended content during revocation", func() {
+        alice, err := client.InitUser("alice", "password")
+        Expect(err).To(BeNil())
+
+        bob, err := client.InitUser("bob", "password")
+        Expect(err).To(BeNil())
+
+        charles, err := client.InitUser("charles", "password")
+        Expect(err).To(BeNil())
+
+        err = alice.StoreFile("a", []byte("A"))
+        Expect(err).To(BeNil())
+
+        err = alice.AppendToFile("a", []byte("B"))
+        Expect(err).To(BeNil())
+
+        err = alice.AppendToFile("a", []byte("C"))
+        Expect(err).To(BeNil())
+
+        bobInvite, err := alice.CreateInvitation("a", "bob")
+        Expect(err).To(BeNil())
+        Expect(bob.AcceptInvitation(
+            "alice",
+            bobInvite,
+            "b",
+        )).To(BeNil())
+
+        charlesInvite, err := alice.CreateInvitation(
+            "a",
+            "charles",
+        )
+        Expect(err).To(BeNil())
+        Expect(charles.AcceptInvitation(
+            "alice",
+            charlesInvite,
+            "c",
+        )).To(BeNil())
+
+        err = alice.RevokeAccess("a", "bob")
+        Expect(err).To(BeNil())
+
+        ownerContent, err := alice.LoadFile("a")
+        Expect(err).To(BeNil())
+        Expect(ownerContent).To(Equal([]byte("ABC")))
+
+        survivorContent, err := charles.LoadFile("c")
+        Expect(err).To(BeNil())
+        Expect(survivorContent).To(Equal([]byte("ABC")))
+    })
+
+    Specify("rejects revoke by a non-owner", func() {
+        alice, err := client.InitUser("alice", "password")
+        Expect(err).To(BeNil())
+
+        bob, err := client.InitUser("bob", "password")
+        Expect(err).To(BeNil())
+
+        // charles, err := client.InitUser("charles", "password")
+        // Expect(err).To(BeNil())
+
+        err = alice.StoreFile("a", []byte("content"))
+        Expect(err).To(BeNil())
+
+        invite, err := alice.CreateInvitation("a", "bob")
+        Expect(err).To(BeNil())
+        Expect(bob.AcceptInvitation(
+            "alice",
+            invite,
+            "b",
+        )).To(BeNil())
+
+        err = bob.RevokeAccess("b", "charles")
+        Expect(err).ToNot(BeNil())
+    })
+
+    Specify("rejects a recipient not directly shared by owner", func() {
+        alice, err := client.InitUser("alice", "password")
+        Expect(err).To(BeNil())
+
+        // bob, err := client.InitUser("bob", "password")
+        // Expect(err).To(BeNil())
+
+        err = alice.StoreFile("a", []byte("content"))
+        Expect(err).To(BeNil())
+
+        err = alice.RevokeAccess("a", "bob")
+        Expect(err).ToNot(BeNil())
+    })
+})
 })
