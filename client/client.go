@@ -1080,7 +1080,11 @@ func (userdata *User) overwriteExistingFile(
 }
 
 func (userdata *User) StoreFile(filename string, content []byte) (err error) {
-	nameUUID, err := getNameSpaceEntryUUID(
+    if userdata == nil {
+        return errors.New("user cannot be nil")
+    }
+
+    nameUUID, err := getNameSpaceEntryUUID(
 		userdata.Username,
 		filename,
 	)
