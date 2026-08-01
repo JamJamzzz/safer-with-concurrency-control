@@ -1080,11 +1080,7 @@ func (userdata *User) overwriteExistingFile(
 }
 
 func (userdata *User) StoreFile(filename string, content []byte) (err error) {
-    if userdata == nil {
-        return errors.New("user cannot be nil")
-    }
-
-    nameUUID, err := getNameSpaceEntryUUID(
+	nameUUID, err := getNameSpaceEntryUUID(
 		userdata.Username,
 		filename,
 	)
@@ -1966,7 +1962,7 @@ func (userdata *User) CreateInvitation(filename string, recipientUsername string
 
 	var protectedBranchBox []byte
     var protectedUpdatedStructure []byte
-    var branchBoxUUID uuid.UUID
+	var structureChanged bool
 
 	if namespaceEntry.IsOwner {
         structure, err :=
@@ -1978,48 +1974,54 @@ func (userdata *User) CreateInvitation(filename string, recipientUsername string
             return uuid.Nil, err
         }
 
-		//Create the 
-		branchBoxUUID = uuid.New()
-        branchBoxEncKey := userlib.RandomBytes(
-            symmetricKeySize,
-        )
-        branchBoxMACKey := userlib.RandomBytes(
-            symmetricKeySize,
-        )
+		record, alreadyTracked :=
+			structure.RecipientBoxes[recipientUsername]
+
+		if !alreadyTracked {
+			record = BranchBoxRecord{
+				BoxUUID: uuid.New(),
+				BoxEncKey: userlib.RandomBytes(
+					symmetricKeySize,
+				),
+				BoxMACKey: userlib.RandomBytes(
+					symmetricKeySize,
+				),
+			}
+
+			structure.RecipientBoxes[recipientUsername] =
+				record
+
+			protectedUpdatedStructure, err =
+				protectDatastoreObject(
+					accessBoxStructureObjectType,
+					accessBox.AccessBoxStructureUUID,
+					structure,
+					namespaceEntry.AccessBoxStructureEncKey,
+					namespaceEntry.AccessBoxStructureMACKey,
+				)
+
+			if err != nil {
+				return uuid.Nil, err
+			}
+
+			structureChanged = true
+		}
 
 		protectedBranchBox, err = protectDatastoreObject(
 			accessBoxObjectType,
-			branchBoxUUID,
+			record.BoxUUID,
 			accessBox,
-			branchBoxEncKey,
-			branchBoxMACKey,
+			record.BoxEncKey,
+			record.BoxMACKey,
 		)
 
 		if err != nil {
             return uuid.Nil, err
         }
 
-		structure.RecipientBoxes[recipientUsername] = BranchBoxRecord{
-			BoxUUID: branchBoxUUID,
-			BoxEncKey: branchBoxEncKey,
-			BoxMACKey: branchBoxMACKey,
-		}
-
-		protectedUpdatedStructure, err = protectDatastoreObject(
-			accessBoxStructureObjectType,
-			accessBox.AccessBoxStructureUUID,
-			structure,
-			namespaceEntry.AccessBoxStructureEncKey,
-			namespaceEntry.AccessBoxStructureMACKey,
-		)
-
-		if err != nil {
-            return uuid.Nil, err
-        }
-
-		grantedBoxUUID = branchBoxUUID
-		grantedBoxEncKey = branchBoxEncKey
-		grantedBoxMACKey = branchBoxMACKey
+		grantedBoxUUID = record.BoxUUID
+		grantedBoxEncKey = record.BoxEncKey
+		grantedBoxMACKey = record.BoxMACKey
 	} else {
 		grantedBoxUUID = namespaceEntry.AccessBoxUUID
 		grantedBoxEncKey = namespaceEntry.AccessBoxEncKey
@@ -2049,15 +2051,17 @@ func (userdata *User) CreateInvitation(filename string, recipientUsername string
 
 	if namespaceEntry.IsOwner {
         userlib.DatastoreSet(
-            branchBoxUUID,
-            protectedBranchBox,
-        )
+			grantedBoxUUID,
+			protectedBranchBox,
+		)
 
-        userlib.DatastoreSet(
-            namespaceEntry.AccessBoxStructureUUID,
-            protectedUpdatedStructure,
-        )
-    }
+		if structureChanged {
+			userlib.DatastoreSet(
+				namespaceEntry.AccessBoxStructureUUID,
+				protectedUpdatedStructure,
+			)
+		}
+	}
 
 	userlib.DatastoreSet(
         invitationUUID,
