@@ -29,7 +29,7 @@ Partner 2 Email (if applicable):
 Also add a link to this repo below (should start with https://github.com/cs161-students/).
 
 Link to this Github repo:
-https://github.com/cs161-students/su26-proj2-safer
+https://github.com/JamJamzzz/safer-with-concurrency-control
 
 ## Concurrency benchmark
 
