@@ -13,12 +13,20 @@ package client
 // - github.com/google/uuid
 // - strconv
 // - strings
+//
+// SAFER-CC extension note: this project has been forked into SAFER-CC, an
+// independent concurrency-control extension (see docs/concurrency-control.md).
+// The import restriction above was specific to the original CS161 autograder
+// and no longer applies here; SAFER-CC additionally uses the Go standard
+// library ("sync/atomic") and its own generic client/lockmanager package.
 
 import (
 	"encoding/json"
 
 	userlib "github.com/cs161-staff/project2-userlib"
 	"github.com/google/uuid"
+
+	"github.com/cs161-staff/project2-starter-code/client/lockmanager"
 
 	// hex.EncodeToString(...) is useful for converting []byte to string
 
@@ -31,10 +39,12 @@ import (
 	// Useful for creating new error messages to return using errors.New("...")
 	"errors"
 
-	// Optional.
-	_ "strconv"
+	"strconv"
 
 	"encoding/hex"
+
+	"sync"
+	"sync/atomic"
 )
 
 // This serves two purposes: it shows you a few useful primitives,
@@ -107,6 +117,69 @@ func someUsefulThings() {
 	_ = fmt.Sprintf("%s_%d", "file", 1)
 }
 
+// ---------------------------------------------------------------------
+// Storage-layer thread safety.
+//
+// userlib's Datastore/Keystore are implemented as plain, unsynchronized Go
+// maps (see project2-userlib's datastoreType/keystoreType). They were never
+// designed for concurrent access from multiple goroutines -- and Go's
+// runtime actively crashes the whole process ("fatal error: concurrent map
+// read and map write") the moment two goroutines touch a map concurrently,
+// independent of the race detector and independent of which logical keys
+// they touch. Phase 4 is the first point in SAFER-CC where operations
+// really do run concurrently against this shared storage, which surfaced
+// exactly that crash during testing.
+//
+// This is a distinct concern from saferLockManager's strict 2PL: the
+// LockManager coordinates SAFER's own logical resources (namespace
+// entries, logical files) so that, e.g., two AppendToFile calls on
+// DIFFERENT files never block each other. But even two operations on
+// completely unrelated files still both end up calling into the very same
+// underlying Go map, and that raw map access itself is not safe without
+// its own, separate guard -- analogous to a real database engine's
+// storage-layer buffer-pool latches being a different mechanism from its
+// transaction manager's row/table locks. datastoreMu/keystoreMu below are
+// that guard: a plain RWMutex around every raw Datastore/Keystore access,
+// with no TxnID, no 2PL semantics, and no participation in
+// saferLockManager whatsoever. Every production call site in this file
+// goes through the datastoreGet/datastoreSet/datastoreDelete/
+// keystoreGet/keystoreSet wrappers below instead of calling
+// userlib.Datastore*/Keystore* directly.
+var datastoreMu sync.RWMutex
+var keystoreMu sync.RWMutex
+
+func datastoreGet(id uuid.UUID) ([]byte, bool) {
+	datastoreMu.RLock()
+	defer datastoreMu.RUnlock()
+	return userlib.DatastoreGet(id)
+}
+
+func datastoreSet(id uuid.UUID, value []byte) {
+	datastoreMu.Lock()
+	defer datastoreMu.Unlock()
+	userlib.DatastoreSet(id, value)
+}
+
+func datastoreDelete(id uuid.UUID) {
+	datastoreMu.Lock()
+	defer datastoreMu.Unlock()
+	userlib.DatastoreDelete(id)
+}
+
+func keystoreGet(name string) (userlib.PublicKeyType, bool) {
+	keystoreMu.RLock()
+	defer keystoreMu.RUnlock()
+	return userlib.KeystoreGet(name)
+}
+
+func keystoreSet(name string, key userlib.PublicKeyType) error {
+	keystoreMu.Lock()
+	defer keystoreMu.Unlock()
+	return userlib.KeystoreSet(name, key)
+}
+
+// ---------------------------------------------------------------------
+
 //Constant variables
 const symmetricKeySize = 16
 
@@ -169,9 +242,9 @@ func getVerifyKeyName(username string) string {
 
 //To check whether this account is taken or not
 func isUsernameTaken(username string, accountUUID uuid.UUID) bool {
-	_, accountExists := userlib.DatastoreGet(accountUUID)
-	_, pkeExists := userlib.KeystoreGet(getPKEKeyName(username))
-	_, verifyExists := userlib.KeystoreGet(getVerifyKeyName(username))
+	_, accountExists := datastoreGet(accountUUID)
+	_, pkeExists := keystoreGet(getPKEKeyName(username))
+	_, verifyExists := keystoreGet(getVerifyKeyName(username))
 
 	return accountExists || pkeExists || verifyExists
 }
@@ -314,7 +387,7 @@ func InitUser(username string, password string) (userdataptr *User, err error) {
 	}
 
 	//Store the key for dec
-	err = userlib.KeystoreSet(
+	err = keystoreSet(
 		getPKEKeyName(username),
 		pkePulic,
 	)
@@ -324,7 +397,7 @@ func InitUser(username string, password string) (userdataptr *User, err error) {
 	}
 
 	//Store the key for verify the d.s.
-	err = userlib.KeystoreSet(
+	err = keystoreSet(
 		getVerifyKeyName(username),
 		verifyPublic,
 	)
@@ -334,7 +407,7 @@ func InitUser(username string, password string) (userdataptr *User, err error) {
 	}
 
 	//Store the emac account to datastore
-	userlib.DatastoreSet(accountUUID, encAccount)
+	datastoreSet(accountUUID, encAccount)
 
 	userdata := User{
 		Username:      username,
@@ -420,7 +493,7 @@ func GetUser(username string, password string) (userdataptr *User, err error) {
     }
 
 	//Get the envelope
-	envelopeBytes, exists := userlib.DatastoreGet(accountUUID)
+	envelopeBytes, exists := datastoreGet(accountUUID)
 
 	if !exists {
 		return nil, errors.New("user account does not exits")
@@ -503,12 +576,284 @@ type FileStatus struct {
 }
 
 //Components of files
+//
+// EpochID and Version are intentionally independent counters:
+//   - EpochID is the security/authorization generation. It changes only
+//     when RevokeAccess rotates capabilities; it says nothing about
+//     whether the file's logical bytes changed.
+//   - Version is the logical file-content generation. It changes only
+//     when the bytes a reader would see via LoadFile actually change
+//     (new file, AppendToFile with non-empty content, or an overwriting
+//     StoreFile). It is preserved unchanged across authorization-only
+//     operations, including epoch rotation during RevokeAccess, because
+//     re-encrypting the same content under a new epoch is a physical
+//     migration, not a logical content mutation.
 type Metadata struct {
 	FileID uuid.UUID
 	EpochID uuid.UUID
+	Version uint64
 	TailUUID uuid.UUID
 	ChunkCount uint64
 }
+
+// nextMetadataVersion computes the version that should be published after a
+// logical content mutation, given the version the mutation observed. It
+// exists so that no call site increments Metadata.Version with a raw "++"
+// (which would silently wrap around on overflow); every increment goes
+// through this overflow-checked helper instead.
+func nextMetadataVersion(current uint64) (uint64, error) {
+	if current == ^uint64(0) {
+		return 0, errors.New("file content version exhausted")
+	}
+
+	return current + 1, nil
+}
+
+// ---------------------------------------------------------------------
+// Phase 4: strict two-phase-locking integration.
+//
+// saferLockManager is the single, process-wide, in-process lock manager
+// used by every SAFER operation that participates in strict 2PL. It is NOT
+// a distributed lock service: it coordinates goroutines within this one
+// process that share the same in-memory userlib Datastore/Keystore. Every
+// caller -- regardless of which *User it is acting on behalf of -- must
+// route through this one instance. A LockManager instantiated per-User
+// would let two different users' operations on the same shared FileID
+// (e.g. an owner and a recipient) run completely uncoordinated with each
+// other, which would defeat the purpose of file-level locking entirely.
+//
+// Phase 4 wires this LockManager into StoreFile, AppendToFile, and
+// LoadFile only. CreateInvitation, AcceptInvitation, and RevokeAccess are
+// intentionally left unintegrated until Phase 5 -- they still exhibit the
+// races documented in the Phase 1 audit. See docs/concurrency-control.md
+// for the full picture of what is and is not yet covered.
+var saferLockManager = lockmanager.NewLockManager()
+
+// txnIDCounter allocates the process-wide monotonic TxnIDs handed to
+// saferLockManager. 0 is reserved/invalid (the zero value of
+// lockmanager.TxnID), so allocateTxnID hands out 1, 2, 3, ... A wrap all
+// the way back around to 0 (practically unreachable at 2^64 allocations,
+// but not left to chance) is reported as an explicit error rather than
+// silently recycling an ID that could collide with a still-active
+// transaction.
+var txnIDCounter atomic.Uint64
+
+// allocateTxnID hands out a fresh, process-wide-unique logical transaction
+// identifier for one SAFER operation to use as its LockManager owner. It
+// never uses goroutine identity (Go does not expose a stable one) -- every
+// call to a Phase-4-integrated public API allocates exactly one TxnID and
+// uses it for every lock that operation acquires.
+//
+// Phase 4.5 hardening: a plain "id := counter.Add(1); if id == 0 { error }"
+// only detects the single call that happens to observe the wraparound --
+// every OTHER call racing near that boundary would still receive
+// Add(1)'s next values (1, 2, 3, ...) again, silently recycling IDs that
+// could collide with still-meaningful ones from process start. Instead,
+// this uses a compare-and-swap loop that refuses to perform the increment
+// at all once the counter is already at math.MaxUint64: no call can ever
+// observe a post-wraparound value, so once the ID space is exhausted,
+// EVERY subsequent call fails, permanently, not just the one call that
+// happened to hit the boundary first.
+func allocateTxnID() (lockmanager.TxnID, error) {
+	for {
+		current := txnIDCounter.Load()
+		if current == ^uint64(0) {
+			return lockmanager.TxnID(0), errors.New("safer-cc: transaction ID space exhausted")
+		}
+
+		next := current + 1
+		if txnIDCounter.CompareAndSwap(current, next) {
+			return lockmanager.TxnID(next), nil
+		}
+		// Another goroutine updated the counter between Load and
+		// CompareAndSwap; retry with the new value.
+	}
+}
+
+// namespaceResourceID builds the logical lock-manager resource identity for
+// the (username, filename) namespace entry. It reuses
+// getNameSpaceEntryUUID, which itself derives from the unambiguous
+// canonicalNamespaceIdentity encoding (see that function's doc comment for
+// why plain delimiter concatenation was not safe here), so the resource
+// key is exactly as collision-resistant as the datastore addressing scheme
+// SAFER already relies on -- no separate, potentially divergent encoding
+// is introduced here.
+func namespaceResourceID(username string, filename string) (lockmanager.ResourceID, error) {
+	nameUUID, err := getNameSpaceEntryUUID(username, filename)
+	if err != nil {
+		return lockmanager.ResourceID{}, err
+	}
+
+	return lockmanager.ResourceID{
+		Type: lockmanager.NamespaceResource,
+		Key:  nameUUID.String(),
+	}, nil
+}
+
+// fileResourceID builds the logical lock-manager resource identity for the
+// logical file identified by fileID. This is deliberately keyed by FileID
+// -- not MetadataUUID, ChunkUUID, AccessBoxUUID, or filename -- because
+// FileID is the one identifier every alias/every authorized user of a
+// given logical file agrees on; locking anything else would let different
+// users (or an owner and a recipient) operate on the same logical file
+// through different, uncoordinated resource keys.
+func fileResourceID(fileID uuid.UUID) lockmanager.ResourceID {
+	return lockmanager.ResourceID{
+		Type: lockmanager.FileResource,
+		Key:  fileID.String(),
+	}
+}
+
+// concurrencyTestHook is a package-private, test-only synchronization
+// point. It is nil in all normal operation, in which case
+// fireConcurrencyTestHook is a no-op and production behavior is completely
+// unaffected. Phase 4's concurrency tests temporarily set it to force
+// deterministic overlapping schedules (e.g. "pause after this operation
+// has loaded Metadata under its file lock, so a test can prove a
+// concurrent operation on the same file really does block on the lock
+// manager, not just on timing") instead of relying on time.Sleep. It is
+// called from a small, fixed set of points inside the Phase-4-integrated
+// operations, each passed a tag identifying the call site and the
+// resource involved.
+//
+// Phase 4.5 hardening: a bare "var concurrencyTestHook func(tag string)",
+// set by plain assignment from a test goroutine and read by plain
+// dereference from concurrently-running production goroutines, is exactly
+// the shape of code the Go race detector is designed to catch -- even
+// though every Phase 4/5 test happens to set it before launching any
+// goroutines that read it (which does establish a happens-before edge via
+// the "go" statement) and only clears it after joining all of them, that
+// safety is a property of test *discipline*, not of the mechanism, and a
+// future test author could easily violate it. concurrencyTestHookPtr uses
+// atomic.Pointer instead, so setting/reading/clearing the hook is safe
+// under -race by construction, independent of any particular test's
+// goroutine-lifecycle care.
+var concurrencyTestHookPtr atomic.Pointer[func(string)]
+
+// setConcurrencyTestHook installs (or, with nil, clears) the package-private
+// test hook. Test-only; never called from production code paths.
+func setConcurrencyTestHook(hook func(tag string)) {
+	if hook == nil {
+		concurrencyTestHookPtr.Store(nil)
+		return
+	}
+
+	concurrencyTestHookPtr.Store(&hook)
+}
+
+func fireConcurrencyTestHook(tag string) {
+	if hookPtr := concurrencyTestHookPtr.Load(); hookPtr != nil {
+		(*hookPtr)(tag)
+	}
+}
+
+// ---------------------------------------------------------------------
+// Phase 6: benchmark-only concurrency strategy switch.
+//
+// Production SAFER-CC always runs under StrategySaferCC -- the real
+// saferLockManager, fine-grained S/X strict 2PL -- which is the zero
+// value of ConcurrencyStrategy. No test in this repository, and no normal
+// caller, ever calls SetConcurrencyStrategyForBenchmark, so every
+// existing behavior/guarantee from Phases 2-5 is completely unaffected by
+// this switch's mere existence.
+//
+// It exists solely so cmd/benchmark can run the exact same business logic
+// -- identical crypto validation, identical datastore calls, identical
+// chunk traversal, identical Metadata.Version bookkeeping, identical
+// authorization checks -- under two baseline coordination strategies, for
+// a fair correctness/performance comparison against the real thing:
+//
+//   - StrategyGlobalLock: one process-wide mutex serializes each public
+//     operation start-to-finish. Simple, obviously correct, but
+//     eliminates concurrency across independent readers and independent
+//     files.
+//   - StrategyNoCC: no logical coordination at all -- deliberately
+//     reproduces the Phase-1-audit races, for correctness comparison
+//     against a "no concurrency control" baseline.
+//
+// In both baseline strategies, datastoreMu/keystoreMu (the storage-engine
+// latches from Phase 4) remain fully active regardless -- they protect Go
+// map memory safety, not SAFER transaction semantics, and disabling them
+// would just crash the process instead of demonstrating a logical race
+// (see docs/concurrency-control.md, "Storage-layer thread safety").
+//
+// Every public operation's body is completely unchanged by this switch
+// except for the single line that constructs its `guard` variable: all
+// three strategies satisfy the same lockGuardLike interface, so which one
+// backs `guard` is the only thing that differs.
+type ConcurrencyStrategy int32
+
+const (
+	StrategySaferCC ConcurrencyStrategy = iota
+	StrategyGlobalLock
+	StrategyNoCC
+)
+
+var activeConcurrencyStrategy atomic.Int32
+
+// SetConcurrencyStrategyForBenchmark switches which coordination strategy
+// subsequent public SAFER operations use, for cmd/benchmark's exclusive
+// use. Not part of the SAFER client API in any meaningful sense.
+func SetConcurrencyStrategyForBenchmark(strategy ConcurrencyStrategy) {
+	activeConcurrencyStrategy.Store(int32(strategy))
+}
+
+var globalBenchmarkMutex sync.Mutex
+
+// lockGuardLike is satisfied by *lockmanager.LockGuard (used unchanged
+// for StrategySaferCC) and by the two benchmark-only stand-ins below.
+type lockGuardLike interface {
+	Acquire(resource lockmanager.ResourceID, mode lockmanager.LockMode) error
+	ReleaseAll()
+}
+
+// globalMutexGuard serializes an entire operation behind one process-wide
+// mutex instead of saferLockManager's fine-grained resources. It ignores
+// which resource/mode is requested -- under a global lock there is only
+// ever one critical section, not per-resource ones -- and takes the
+// mutex on the first Acquire call for this transaction only (an
+// operation may call Acquire twice: once for Namespace, once for File).
+type globalMutexGuard struct {
+	once   sync.Once
+	locked bool
+}
+
+func (g *globalMutexGuard) Acquire(_ lockmanager.ResourceID, _ lockmanager.LockMode) error {
+	g.once.Do(func() {
+		globalBenchmarkMutex.Lock()
+		g.locked = true
+	})
+	return nil
+}
+
+func (g *globalMutexGuard) ReleaseAll() {
+	if g.locked {
+		globalBenchmarkMutex.Unlock()
+	}
+}
+
+// noCCGuard performs no coordination whatsoever -- the No-CC benchmark
+// baseline.
+type noCCGuard struct{}
+
+func (noCCGuard) Acquire(_ lockmanager.ResourceID, _ lockmanager.LockMode) error { return nil }
+func (noCCGuard) ReleaseAll()                                                   {}
+
+// newOperationGuard is the one call site every public operation uses to
+// obtain its lock guard. Swapping strategies never touches anything else
+// in an operation's body.
+func newOperationGuard(txn lockmanager.TxnID) lockGuardLike {
+	switch ConcurrencyStrategy(activeConcurrencyStrategy.Load()) {
+	case StrategyGlobalLock:
+		return &globalMutexGuard{}
+	case StrategyNoCC:
+		return &noCCGuard{}
+	default:
+		return lockmanager.NewLockGuard(saferLockManager, txn)
+	}
+}
+
+// ---------------------------------------------------------------------
 
 type Chunk struct {
 	FileID uuid.UUID
@@ -534,9 +879,41 @@ type AccessBoxStructure struct {
 /**
 Helper functions for StoreFile
 **/
+
+// canonicalNamespaceIdentity builds an unambiguous byte encoding of the
+// logical (username, filename) pair that identifies one namespace entry.
+//
+// Phase 4.5 hardening: the previous encoding was plain delimiter
+// concatenation (username + "-" + filename), which is ambiguous --
+// username="a-b", filename="c" and username="a", filename="b-c" both
+// concatenate to "a-b-c" and would hash to the identical NamespaceEntry
+// UUID and identical NamespaceResource lock identity, letting two
+// completely different users' files (or two different filenames for the
+// same user) collide. This uses netstring-style length-prefix encoding
+// (<decimal length>:<bytes>, repeated per field): a decoder would read the
+// decimal digits up to the ':', then consume exactly that many bytes
+// verbatim regardless of their content (including any ':' or '-'
+// characters inside them), then continue with the next field. Because
+// each field's length is stated before its content, no byte sequence in
+// one field can ever be reinterpreted as spilling into the length or
+// content of another -- the mapping from (username, filename) pairs to
+// encoded byte strings is injective, which delimiter concatenation alone
+// is not.
+func canonicalNamespaceIdentity(username string, filename string) []byte {
+	encoded := strconv.Itoa(len(username)) + ":" + username +
+		strconv.Itoa(len(filename)) + ":" + filename
+
+	return []byte(encoded)
+}
+
+// getNameSpaceEntryUUID and namespaceResourceID (below) both derive from
+// canonicalNamespaceIdentity, so datastore identity (which NamespaceEntry
+// object a given (username, filename) resolves to) and logical lock
+// identity (which saferLockManager resource protects it) can never diverge
+// -- there is exactly one canonical namespace identity, used for both.
 func getNameSpaceEntryUUID (username string, filename string,) (uuid.UUID, error) {
 	nameHash := userlib.Hash(
-		[]byte(username + "-" + filename),
+		canonicalNamespaceIdentity(username, filename),
 	)
 
 	return uuid.FromBytes(nameHash[:16])
@@ -765,9 +1142,18 @@ func createFileStatus (
 }
 
 //If the file hasnt been create yet, store the new file
-func (userdata *User) storeNewFile(
+// storeNewFileLocked creates a brand-new logical file and publishes it
+// under fileID. It assumes the caller (StoreFile) already holds
+// X(namespace(userdata.Username, filename)) and X(file(fileID)) for the
+// entire duration of this call -- it does not acquire, and must never
+// acquire, any lock itself. fileID is supplied by the caller (rather than
+// generated here) precisely so that the File X lock StoreFile already
+// acquired is guaranteed to match the FileID this function actually
+// publishes.
+func (userdata *User) storeNewFileLocked(
 	filename string,
 	content []byte,
+	fileID uuid.UUID,
 ) error {
 	//Calculate the local namespace entry
 	nameUUID, err := getNameSpaceEntryUUID(
@@ -789,8 +1175,7 @@ func (userdata *User) storeNewFile(
     	return err
 	}
 
-	//Generate every random ids:
-	fileID := uuid.New()
+	//Generate the remaining random ids (fileID is supplied by the caller):
 	epochID := uuid.New()
 
 	fileRoot := userlib.RandomBytes(symmetricKeySize)
@@ -844,6 +1229,7 @@ func (userdata *User) storeNewFile(
 	metadata := Metadata{
 		FileID: fileID,
 		EpochID: epochID,
+		Version: 1,
 		TailUUID: baseChunkUUID,
 		ChunkCount: 1,
 	}
@@ -941,32 +1327,32 @@ func (userdata *User) storeNewFile(
     	return err
 	}
 
-	userlib.DatastoreSet(
+	datastoreSet(
 		baseChunkUUID,
 		protectedChunk,
 	)
 
-	userlib.DatastoreSet(
+	datastoreSet(
 		metadataUUID,
 		protectedMetadata,
 	)
 
-	userlib.DatastoreSet(
+	datastoreSet(
 		ownerAccessBoxUUID,
 		protectedAccessBox,
 	)
 
-	userlib.DatastoreSet(
+	datastoreSet(
 		statusUUID,
 		fileStatusBytes,
 	)
 
-	userlib.DatastoreSet(
+	datastoreSet(
 		structureUUID,
 		protectedAccessBoxStructure,
 	)
 
-	userlib.DatastoreSet(
+	datastoreSet(
 		nameUUID,
 		protectedNamespaceEntry,
 	)
@@ -978,21 +1364,24 @@ func (userdata *User) storeNewFile(
 If the file already exists, we rewrite the file
 **/
 
-func (userdata *User) overwriteExistingFile(
-	filename string,
+// overwriteExistingFileLocked replaces the logical content behind an
+// already-resolved, already-revalidated accessBox. The caller
+// (StoreFile) is responsible for acquiring X(namespace(...)) and
+// X(file(accessBox.FileID)) and for revalidating accessBox under the file
+// lock (via validateFileAccessUnderLock) before calling this -- this
+// function performs no locking and no access-control revalidation of its
+// own; it assumes both are already established and still held.
+func overwriteExistingFileLocked(
+	accessBox AccessBox,
 	content []byte,
 ) error {
-	 _, accessBox, err := resolveFile(
-        userdata,
-        filename,
-    )
-    if err != nil {
-        return err
-    }
 	metadata, err := loadMetadata(accessBox)
     if err != nil {
         return err
     }
+
+	fireConcurrencyTestHook("overwrite:metadata-loaded:" + accessBox.FileID.String())
+
 	_, oldChunkUUIDs, err :=
         loadFileContentAndChunkUUIDs(
             accessBox,
@@ -1042,9 +1431,18 @@ func (userdata *User) overwriteExistingFile(
     if err != nil {
         return err
     }
+
+	// An overwrite always replaces the logical content, so the content
+	// version advances exactly once, even though ChunkCount resets to 1.
+	newVersion, err := nextMetadataVersion(metadata.Version)
+	if err != nil {
+		return err
+	}
+
 	newMetadata := Metadata{
         FileID:     accessBox.FileID,
         EpochID:    accessBox.EpochID,
+        Version:    newVersion,
         TailUUID:   newBaseChunkUUID,
         ChunkCount: 1,
     }
@@ -1062,24 +1460,54 @@ func (userdata *User) overwriteExistingFile(
     }
 
 	//Set the new chunk and new metadata
-	userlib.DatastoreSet(
+	datastoreSet(
         newBaseChunkUUID,
         protectedNewChunk,
     )
 
-    userlib.DatastoreSet(
+    datastoreSet(
         accessBox.MetadataUUID,
         protectedNewMetadata,
     )
 	for _, oldChunkUUID := range oldChunkUUIDs {
-        userlib.DatastoreDelete(oldChunkUUID)
+        datastoreDelete(oldChunkUUID)
     }
 
     return nil
 
 }
 
+// StoreFile is the strict-2PL transaction boundary for both file creation
+// and overwrite. Lock acquisition order, per operation:
+//
+//	create path:    X(namespace(user, filename))  ->  X(file(new FileID))
+//	overwrite path: X(namespace(user, filename))  ->  X(file(existing FileID))
+//
+// Namespace X is acquired first and held for the whole call (including
+// across the create-vs-overwrite existence check), which is what makes
+// that check-then-act decision atomic: no concurrent StoreFile for the
+// same (user, filename) can observe or change namespace existence while
+// this transaction is deciding. All locks are released via
+// guard.ReleaseAll(), deferred immediately after the guard is created, so
+// every return path (success or error) releases them.
 func (userdata *User) StoreFile(filename string, content []byte) (err error) {
+	txn, err := allocateTxnID()
+	if err != nil {
+		return err
+	}
+
+	guard := newOperationGuard(txn)
+	defer guard.ReleaseAll()
+
+	nsResource, err := namespaceResourceID(userdata.Username, filename)
+	if err != nil {
+		return err
+	}
+
+	if err := guard.Acquire(nsResource, lockmanager.ExclusiveLock); err != nil {
+		return err
+	}
+
 	nameUUID, err := getNameSpaceEntryUUID(
 		userdata.Username,
 		filename,
@@ -1089,32 +1517,88 @@ func (userdata *User) StoreFile(filename string, content []byte) (err error) {
         return err
     }
 
-	_, exists := userlib.DatastoreGet(nameUUID)
+	_, exists := datastoreGet(nameUUID)
 
 	if exists {
-		return userdata.overwriteExistingFile(
-			filename,
-			content,
-		)
+		namespaceEntry, err := loadNamespaceEntry(userdata, filename)
+		if err != nil {
+			return err
+		}
+
+		fileResource := fileResourceID(namespaceEntry.FileID)
+		if err := guard.Acquire(fileResource, lockmanager.ExclusiveLock); err != nil {
+			return err
+		}
+
+		accessBox, err := validateFileAccessUnderLock(namespaceEntry)
+		if err != nil {
+			return err
+		}
+
+		return overwriteExistingFileLocked(accessBox, content)
 	}
 
-	return userdata.storeNewFile(filename, content)
+	fileID := uuid.New()
+
+	fileResource := fileResourceID(fileID)
+	if err := guard.Acquire(fileResource, lockmanager.ExclusiveLock); err != nil {
+		return err
+	}
+
+	return userdata.storeNewFileLocked(filename, content, fileID)
 }
 
+// AppendToFile is the strict-2PL transaction boundary for content append.
+// Lock acquisition order: S(namespace(user, filename)) -> X(file(FileID)).
+// Namespace only needs S because the append does not change which FileID
+// the namespace entry points to. File needs X because Metadata (TailUUID,
+// ChunkCount, Version) is mutated. Critically, Metadata is loaded (via
+// loadMetadata, inside validateFileAccessUnderLock's caller below) only
+// after File X has been granted -- no snapshot of Metadata taken before
+// that point is ever used to compute the update, which is what closes the
+// lost-update race described in the Phase 1 audit and Phase 3's
+// documented limitation.
 func (userdata *User) AppendToFile(filename string, content []byte) error {
-	_, accessBox, err := resolveFile(
-		userdata,
-		filename,
-	)
-
+	txn, err := allocateTxnID()
 	if err != nil {
-		return err 
+		return err
 	}
 
+	guard := newOperationGuard(txn)
+	defer guard.ReleaseAll()
+
+	nsResource, err := namespaceResourceID(userdata.Username, filename)
+	if err != nil {
+		return err
+	}
+
+	if err := guard.Acquire(nsResource, lockmanager.SharedLock); err != nil {
+		return err
+	}
+
+	namespaceEntry, err := loadNamespaceEntry(userdata, filename)
+	if err != nil {
+		return err
+	}
+
+	fileResource := fileResourceID(namespaceEntry.FileID)
+	if err := guard.Acquire(fileResource, lockmanager.ExclusiveLock); err != nil {
+		return err
+	}
+
+	accessBox, err := validateFileAccessUnderLock(namespaceEntry)
+	if err != nil {
+		return err
+	}
+
+	// Metadata is deliberately (re)loaded here, strictly after File X was
+	// granted above -- never reuse a Metadata value read before this line.
 	metadata, err := loadMetadata(accessBox)
 	if err != nil {
-		return err 
+		return err
 	}
+
+	fireConcurrencyTestHook("append:metadata-loaded:" + filename)
 
 	if len(content) == 0 {
 		return nil
@@ -1156,9 +1640,20 @@ func (userdata *User) AppendToFile(filename string, content []byte) error {
         return err
     }
 
+	// Phase 4: safe. metadata was loaded above only after File X was
+	// granted, and File X is held for the rest of this function (released
+	// only via the deferred guard.ReleaseAll() in AppendToFile), so no
+	// other transaction can read or write this file's Metadata/chunks
+	// concurrently with this increment.
+	newVersion, err := nextMetadataVersion(metadata.Version)
+	if err != nil {
+		return err
+	}
+
 	updatedMetadata := Metadata{
         FileID:     metadata.FileID,
         EpochID:    metadata.EpochID,
+        Version:    newVersion,
         TailUUID:   newChunkUUID,
         ChunkCount: metadata.ChunkCount + 1,
     }
@@ -1175,12 +1670,12 @@ func (userdata *User) AppendToFile(filename string, content []byte) error {
         return err
     }
 
-	userlib.DatastoreSet(
+	datastoreSet(
         newChunkUUID,
         protectedNewChunk,
     )
 
-    userlib.DatastoreSet(
+    datastoreSet(
         accessBox.MetadataUUID,
         protectedUpdatedMetadata,
     )
@@ -1211,7 +1706,7 @@ func loadDatastoreObject(
         return errors.New("invalid object keys")
     }
 
-    envelopeBytes, exists := userlib.DatastoreGet(objectUUID)
+    envelopeBytes, exists := datastoreGet(objectUUID)
     if !exists {
         return errors.New("required datastore object is missing")
     }
@@ -1266,7 +1761,7 @@ func verifyFileStatus(
 		return errors.New("invalid status uuid")
 	}
 
-	statusBytes, exists := userlib.DatastoreGet(
+	statusBytes, exists := datastoreGet(
 		accessBox.StatusUUID,
 	)
 
@@ -1281,7 +1776,7 @@ func verifyFileStatus(
         return errors.New("invalid file status")
     }
 
-	verifyKey, exists := userlib.KeystoreGet(
+	verifyKey, exists := keystoreGet(
 		accessBox.OwnerVerifyKeyName,
 	)
 
@@ -1340,40 +1835,45 @@ func verifyFileStatus(
     return nil
 }
 
-func resolveFile(
-	userdata *User,
-	filename string,
-) (
-	NamespaceEntry,
-	AccessBox,
-	error,
-) {
+// loadNamespaceEntry loads and authenticates userdata's NamespaceEntry for
+// filename. This is purely namespace-resource work: it never touches the
+// AccessBox or FileStatus, so it is safe to call while holding only the
+// namespace(user, filename) lock (S or X). It does NOT itself acquire any
+// lock -- per the Phase 4 architecture, public API transaction boundaries
+// (StoreFile/AppendToFile/LoadFile) own lock acquisition; this helper only
+// performs data work and assumes the appropriate namespace lock is already
+// held by its caller.
+//
+// The NamespaceEntry this returns must still be revalidated by
+// validateFileAccessUnderLock after the file(FileID) lock is acquired --
+// it is not yet safe to trust its AccessBoxUUID/keys as "the current
+// capability," because a concurrent RevokeAccess could rotate them before
+// (or, without a file lock, even while) the caller acts on them.
+func loadNamespaceEntry(userdata *User, filename string) (NamespaceEntry, error) {
 	var emptyEntry NamespaceEntry
-    var emptyAccessBox AccessBox
 
 	if userdata == nil {
-        return emptyEntry, emptyAccessBox,
-            errors.New("user cannot be nil")
-    }
+		return emptyEntry, errors.New("user cannot be nil")
+	}
 
-    nameUUID, err := getNameSpaceEntryUUID(
-        userdata.Username,
-        filename,
-    )
-    if err != nil {
-        return emptyEntry, emptyAccessBox, err
-    }
+	nameUUID, err := getNameSpaceEntryUUID(
+		userdata.Username,
+		filename,
+	)
+	if err != nil {
+		return emptyEntry, err
+	}
 
-    namespaceEncKey, namespaceMACKey, err :=
-        deriveNamespaceEntryKeys(
-            userdata.NamespaceRoot,
-            filename,
-        )
-    if err != nil {
-        return emptyEntry, emptyAccessBox, err
-    }
+	namespaceEncKey, namespaceMACKey, err :=
+		deriveNamespaceEntryKeys(
+			userdata.NamespaceRoot,
+			filename,
+		)
+	if err != nil {
+		return emptyEntry, err
+	}
 
-    var namespaceEntry NamespaceEntry
+	var namespaceEntry NamespaceEntry
 
 	//Get the namespaceEntry
 	err = loadDatastoreObject(
@@ -1385,92 +1885,262 @@ func resolveFile(
 	)
 
 	if err != nil {
-        return emptyEntry, emptyAccessBox, err
-    }
+		return emptyEntry, err
+	}
 
 	if namespaceEntry.FileID == uuid.Nil {
-        return emptyEntry, emptyAccessBox,
-            errors.New("invalid namespace FileID")
-    }
+		return emptyEntry, errors.New("invalid namespace FileID")
+	}
 
-    if namespaceEntry.AccessBoxUUID == uuid.Nil {
-        return emptyEntry, emptyAccessBox,
-            errors.New("invalid access box UUID")
-    }
+	if namespaceEntry.AccessBoxUUID == uuid.Nil {
+		return emptyEntry, errors.New("invalid access box UUID")
+	}
 
-    if len(namespaceEntry.AccessBoxEncKey) !=
-        symmetricKeySize {
-        return emptyEntry, emptyAccessBox,
-            errors.New("invalid access box encryption key")
-    }
+	if len(namespaceEntry.AccessBoxEncKey) != symmetricKeySize {
+		return emptyEntry, errors.New("invalid access box encryption key")
+	}
 
-    if len(namespaceEntry.AccessBoxMACKey) !=
-        symmetricKeySize {
-        return emptyEntry, emptyAccessBox,
-            errors.New("invalid access box MAC key")
-    }
+	if len(namespaceEntry.AccessBoxMACKey) != symmetricKeySize {
+		return emptyEntry, errors.New("invalid access box MAC key")
+	}
 
+	return namespaceEntry, nil
+}
+
+// validateFileAccessUnderLock loads and fully authenticates the AccessBox
+// referenced by namespaceEntry -- including verifying its FileStatus,
+// which is the check that detects a stale/revoked AccessBox. It performs
+// no locking of its own: its authoritativeness comes entirely from the
+// caller's contract to invoke it only after already holding the
+// file(namespaceEntry.FileID) lock (S or X). Under that contract, this
+// read is guaranteed to observe any RevokeAccess that had already
+// committed, and (once RevokeAccess itself is integrated in Phase 5) no
+// RevokeAccess can commit while this read is in progress -- this is what
+// eliminates the TOCTOU race between validation and use that the
+// unlocked, single-shot resolveFile could not close on its own.
+func validateFileAccessUnderLock(namespaceEntry NamespaceEntry) (AccessBox, error) {
+	var emptyAccessBox AccessBox
 	var accessBox AccessBox
 
-    err = loadDatastoreObject(
-        accessBoxObjectType,
-        namespaceEntry.AccessBoxUUID,
-        namespaceEntry.AccessBoxEncKey,
-        namespaceEntry.AccessBoxMACKey,
-        &accessBox,
-    )
-    if err != nil {
-        return emptyEntry, emptyAccessBox, err
-    }
+	err := loadDatastoreObject(
+		accessBoxObjectType,
+		namespaceEntry.AccessBoxUUID,
+		namespaceEntry.AccessBoxEncKey,
+		namespaceEntry.AccessBoxMACKey,
+		&accessBox,
+	)
+	if err != nil {
+		return emptyAccessBox, err
+	}
 
-    if accessBox.FileID != namespaceEntry.FileID {
-        return emptyEntry, emptyAccessBox,
-            errors.New("access box FileID mismatch")
-    }
+	if accessBox.FileID != namespaceEntry.FileID {
+		return emptyAccessBox, errors.New("access box FileID mismatch")
+	}
 
-    if accessBox.EpochID == uuid.Nil {
-        return emptyEntry, emptyAccessBox,
-            errors.New("invalid access box epoch")
-    }
+	if accessBox.EpochID == uuid.Nil {
+		return emptyAccessBox, errors.New("invalid access box epoch")
+	}
 
-    if accessBox.MetadataUUID == uuid.Nil {
-        return emptyEntry, emptyAccessBox,
-            errors.New("invalid metadata UUID")
-    }
+	if accessBox.MetadataUUID == uuid.Nil {
+		return emptyAccessBox, errors.New("invalid metadata UUID")
+	}
 
-    if len(accessBox.MetadataEncKey) != symmetricKeySize ||
-        len(accessBox.MetadataMACKey) != symmetricKeySize {
-        return emptyEntry, emptyAccessBox,
-            errors.New("invalid metadata keys")
-    }
+	if len(accessBox.MetadataEncKey) != symmetricKeySize ||
+		len(accessBox.MetadataMACKey) != symmetricKeySize {
+		return emptyAccessBox, errors.New("invalid metadata keys")
+	}
 
-    if len(accessBox.FileRoot) != symmetricKeySize {
-        return emptyEntry, emptyAccessBox,
-            errors.New("invalid file root")
-    }
+	if len(accessBox.FileRoot) != symmetricKeySize {
+		return emptyAccessBox, errors.New("invalid file root")
+	}
 
-    if accessBox.AccessBoxStructureUUID == uuid.Nil {
-        return emptyEntry, emptyAccessBox,
-            errors.New("invalid access box structure UUID")
-    }
+	if accessBox.AccessBoxStructureUUID == uuid.Nil {
+		return emptyAccessBox, errors.New("invalid access box structure UUID")
+	}
 
-    if accessBox.StatusUUID == uuid.Nil {
-        return emptyEntry, emptyAccessBox,
-            errors.New("invalid status UUID")
-    }
+	if accessBox.StatusUUID == uuid.Nil {
+		return emptyAccessBox, errors.New("invalid status UUID")
+	}
 
-    if accessBox.OwnerVerifyKeyName == "" {
-        return emptyEntry, emptyAccessBox,
-            errors.New("missing owner verification key name")
-    }
+	if accessBox.OwnerVerifyKeyName == "" {
+		return emptyAccessBox, errors.New("missing owner verification key name")
+	}
 
-    err = verifyFileStatus(accessBox)
-    if err != nil {
-        return emptyEntry, emptyAccessBox, err
-    }
+	err = verifyFileStatus(accessBox)
+	if err != nil {
+		return emptyAccessBox, err
+	}
 
-    return namespaceEntry, accessBox, nil
+	return accessBox, nil
 }
+
+// validateInvitationAccessUnderLock is validateFileAccessUnderLock's
+// counterpart for AcceptInvitation: the recipient does not yet have a
+// NamespaceEntry (that is precisely what this operation is about to
+// install), so there is nothing to key the AccessBox lookup off except the
+// invitation payload's own AccessBoxUUID/keys. It performs exactly the
+// same two checks AcceptInvitation always performed (FileID agreement,
+// then FileStatus verification) -- Phase 5 does not tighten this
+// validation, it only relocates it. Like validateFileAccessUnderLock, this
+// performs no locking of its own: it is authoritative only because the
+// caller's contract is to invoke it after already holding
+// file(payload.FileID) (S is sufficient -- AcceptInvitation never mutates
+// shared file state). Under that contract, a RevokeAccess that already
+// committed is guaranteed visible here, and (since RevokeAccess also takes
+// File X) none can commit while this read is in flight.
+func validateInvitationAccessUnderLock(payload InvitationPayload) (AccessBox, error) {
+	var emptyAccessBox AccessBox
+	var accessBox AccessBox
+
+	err := loadDatastoreObject(
+		accessBoxObjectType,
+		payload.AccessBoxUUID,
+		payload.AccessBoxEncKey,
+		payload.AccessBoxMACKey,
+		&accessBox,
+	)
+	if err != nil {
+		return emptyAccessBox, err
+	}
+
+	if accessBox.FileID != payload.FileID {
+		return emptyAccessBox, errors.New("invitation and AccessBox FileID mismatch")
+	}
+
+	err = verifyFileStatus(accessBox)
+	if err != nil {
+		return emptyAccessBox, err
+	}
+
+	return accessBox, nil
+}
+
+// resolveFile composes loadNamespaceEntry and validateFileAccessUnderLock
+// back into the single-shot, unlocked resolution the original
+// implementation performed. As of Phase 5, every public SAFER operation
+// (StoreFile, AppendToFile, LoadFile, CreateInvitation, AcceptInvitation,
+// RevokeAccess) is integrated with saferLockManager and none of them call
+// this unlocked path any more -- it is kept only as a convenience for
+// tests and any future ad hoc, non-transactional inspection of current
+// state. Production operations must acquire the appropriate Namespace/File
+// locks and call loadNamespaceEntry / validateFileAccessUnderLock (or
+// validateInvitationAccessUnderLock) directly, with the lock acquired in
+// between, exactly as StoreFile/AppendToFile/LoadFile/CreateInvitation/
+// AcceptInvitation/RevokeAccess all now do.
+func resolveFile(
+	userdata *User,
+	filename string,
+) (
+	NamespaceEntry,
+	AccessBox,
+	error,
+) {
+	namespaceEntry, err := loadNamespaceEntry(userdata, filename)
+	if err != nil {
+		return NamespaceEntry{}, AccessBox{}, err
+	}
+
+	accessBox, err := validateFileAccessUnderLock(namespaceEntry)
+	if err != nil {
+		return NamespaceEntry{}, AccessBox{}, err
+	}
+
+	return namespaceEntry, accessBox, nil
+}
+
+// ---------------------------------------------------------------------
+// Phase 6: diagnostic, benchmark-only exports.
+//
+// Metadata.Version is deliberately NOT part of SAFER's public API (see
+// Phase 3): it is an internal implementation detail, and StoreFile/
+// LoadFile/etc. never expose it. But Phase 6's evaluation needs exactly
+// this value as its strongest correctness oracle ("N successful content
+// mutations should mean Version advanced by exactly N"), and
+// cmd/benchmark is a separate package that cannot see unexported
+// identifiers. These two functions are the minimal, explicitly-named
+// exception: diagnostic surface for cmd/benchmark only, not part of the
+// 8-function graded SAFER API (InitUser, GetUser, StoreFile, LoadFile,
+// AppendToFile, CreateInvitation, AcceptInvitation, RevokeAccess), and not
+// intended for any other caller.
+// ---------------------------------------------------------------------
+
+// DebugFileVersionForBenchmark returns the current Metadata.Version and
+// ChunkCount for filename, as seen by owner. Benchmark-only; see the
+// package note above.
+func DebugFileVersionForBenchmark(owner *User, filename string) (version uint64, chunkCount uint64, err error) {
+	_, accessBox, err := resolveFile(owner, filename)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	metadata, err := loadMetadata(accessBox)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	return metadata.Version, metadata.ChunkCount, nil
+}
+
+// CheckAuthorizationInvariantsForBenchmark re-validates the persistent
+// Phase 5 authorization invariants (owner AccessBox epoch ==
+// AccessBoxStructure.CurrentEpoch; Metadata.EpochID matches the current
+// epoch; Metadata.Version equals expectedVersion; every surviving
+// recipient's branch AccessBox is stamped with the current epoch) and
+// returns a description of the first violation found, or "" if none.
+// Benchmark-only; see the package note above.
+func CheckAuthorizationInvariantsForBenchmark(owner *User, filename string, expectedVersion uint64) string {
+	namespaceEntry, accessBox, err := resolveFile(owner, filename)
+	if err != nil {
+		return "resolveFile: " + err.Error()
+	}
+
+	if !namespaceEntry.IsOwner {
+		return "caller is not the owner"
+	}
+
+	structure, err := loadOwnerAccessBoxStructure(namespaceEntry, accessBox)
+	if err != nil {
+		return "loadOwnerAccessBoxStructure: " + err.Error()
+	}
+
+	if structure.CurrentEpoch != accessBox.EpochID {
+		return "AccessBoxStructure.CurrentEpoch does not match owner AccessBox.EpochID"
+	}
+
+	metadata, err := loadMetadata(accessBox)
+	if err != nil {
+		return "loadMetadata: " + err.Error()
+	}
+
+	if metadata.EpochID != accessBox.EpochID {
+		return "Metadata.EpochID does not match the current epoch"
+	}
+
+	if metadata.Version != expectedVersion {
+		return fmt.Sprintf("Metadata.Version = %d, expected %d", metadata.Version, expectedVersion)
+	}
+
+	for recipient, record := range structure.RecipientBoxes {
+		var branchBox AccessBox
+		err := loadDatastoreObject(
+			accessBoxObjectType,
+			record.BoxUUID,
+			record.BoxEncKey,
+			record.BoxMACKey,
+			&branchBox,
+		)
+		if err != nil {
+			return "recipient " + recipient + " branch AccessBox: " + err.Error()
+		}
+		if branchBox.EpochID != structure.CurrentEpoch {
+			return "recipient " + recipient + " branch AccessBox is stamped with a stale epoch"
+		}
+	}
+
+	return ""
+}
+
+// ---------------------------------------------------------------------
 
 //load metadata from datastore
 func loadMetadata (
@@ -1502,6 +2172,18 @@ func loadMetadata (
     if metadata.ChunkCount == 0 {
         return Metadata{},
             errors.New("metadata has zero chunks")
+    }
+
+    // Every SAFER-CC V1 metadata object is created with Version >= 1
+    // (storeNewFile sets 1; AppendToFile/overwrite advance it via
+    // nextMetadataVersion; RevokeAccess preserves it unchanged). There are
+    // no legacy pre-V1 fixtures in this repository that would deserialize
+    // with Version == 0, so this is enforced strictly rather than
+    // silently normalized -- Version == 0 always indicates corrupted or
+    // forged metadata.
+    if metadata.Version == 0 {
+        return Metadata{},
+            errors.New("metadata has invalid content version")
     }
 
     if metadata.TailUUID == uuid.Nil {
@@ -1619,15 +2301,51 @@ func loadFileContentAndChunkUUIDs(
     return content, chunkUUIDs, nil
 }
 
+// LoadFile is the strict-2PL transaction boundary for reads. Lock
+// acquisition order: S(namespace(user, filename)) -> S(file(FileID)). Both
+// locks are Shared, so many concurrent LoadFile calls (and, once Phase 5
+// lands, CreateInvitation calls) can proceed together against the same
+// file -- readers are never serialized against each other. What Shared
+// does guarantee is mutual exclusion against any Exclusive holder: a
+// concurrent AppendToFile/overwrite cannot be interleaved mid-mutation
+// while this read is in progress, and this read cannot start mid-mutation
+// either, so the AccessBox/Metadata/chunk chain observed here is always
+// one complete, self-consistent logical file state -- never a half
+// re-chunked overwrite or a half-published append.
 func (userdata *User) LoadFile(filename string) (content []byte, err error) {
-	_, accessBox, err := resolveFile(
-		userdata,
-		filename,
-	)
-
+	txn, err := allocateTxnID()
 	if err != nil {
 		return nil, err
 	}
+
+	guard := newOperationGuard(txn)
+	defer guard.ReleaseAll()
+
+	nsResource, err := namespaceResourceID(userdata.Username, filename)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := guard.Acquire(nsResource, lockmanager.SharedLock); err != nil {
+		return nil, err
+	}
+
+	namespaceEntry, err := loadNamespaceEntry(userdata, filename)
+	if err != nil {
+		return nil, err
+	}
+
+	fileResource := fileResourceID(namespaceEntry.FileID)
+	if err := guard.Acquire(fileResource, lockmanager.SharedLock); err != nil {
+		return nil, err
+	}
+
+	accessBox, err := validateFileAccessUnderLock(namespaceEntry)
+	if err != nil {
+		return nil, err
+	}
+
+	fireConcurrencyTestHook("load:file-locked:" + filename)
 
 	metadata, err := loadMetadata(accessBox)
 
@@ -1924,18 +2642,55 @@ func loadOwnerAccessBoxStructure(
     return structure, nil
 }
 
+// CreateInvitation is the strict-2PL transaction boundary for sharing.
+// Lock acquisition order: S(namespace(user, filename)) -> X(file(FileID)).
+// File needs X, not S, because the owner branch mutates
+// AccessBoxStructure.RecipientBoxes -- shared authorization-control state
+// -- and a non-owner (resharing) branch is conservatively given the same
+// X requirement for protocol uniformity (see docs/concurrency-control.md,
+// "granularity tradeoff": V1 does not split content-mutation locking from
+// authorization-mutation locking, so CreateInvitation currently serializes
+// against AppendToFile/overwrite/other CreateInvitation calls on the same
+// file, even when it only touches its own branch). Namespace only needs S
+// because CreateInvitation never changes which FileID the caller's own
+// namespace entry points to.
 func (userdata *User) CreateInvitation(filename string, recipientUsername string) (
 	invitationPtr uuid.UUID, err error) {
-	namespaceEntry, accessBox, err := resolveFile(
-		userdata,
-		filename,
-	)
-
+	txn, err := allocateTxnID()
 	if err != nil {
-        return uuid.Nil, err
-    }
+		return uuid.Nil, err
+	}
 
-	recipientPKEKey, exists := userlib.KeystoreGet(
+	guard := newOperationGuard(txn)
+	defer guard.ReleaseAll()
+
+	nsResource, err := namespaceResourceID(userdata.Username, filename)
+	if err != nil {
+		return uuid.Nil, err
+	}
+
+	if err := guard.Acquire(nsResource, lockmanager.SharedLock); err != nil {
+		return uuid.Nil, err
+	}
+
+	namespaceEntry, err := loadNamespaceEntry(userdata, filename)
+	if err != nil {
+		return uuid.Nil, err
+	}
+
+	fileResource := fileResourceID(namespaceEntry.FileID)
+	if err := guard.Acquire(fileResource, lockmanager.ExclusiveLock); err != nil {
+		return uuid.Nil, err
+	}
+
+	// Revalidated fresh, under File X -- never reuse AccessBox/FileStatus
+	// state read before this lock was granted.
+	accessBox, err := validateFileAccessUnderLock(namespaceEntry)
+	if err != nil {
+		return uuid.Nil, err
+	}
+
+	recipientPKEKey, exists := keystoreGet(
         getPKEKeyName(recipientUsername),
     )
     if !exists || recipientPKEKey.KeyType != "PKE" {
@@ -1944,7 +2699,7 @@ func (userdata *User) CreateInvitation(filename string, recipientUsername string
     }
 
     recipientVerifyKey, exists :=
-        userlib.KeystoreGet(
+        keystoreGet(
             getVerifyKeyName(recipientUsername),
         )
     if !exists ||
@@ -1973,6 +2728,8 @@ func (userdata *User) CreateInvitation(filename string, recipientUsername string
         if err != nil {
             return uuid.Nil, err
         }
+
+		fireConcurrencyTestHook("create-invitation:structure-loaded:" + accessBox.FileID.String())
 
 		record, alreadyTracked :=
 			structure.RecipientBoxes[recipientUsername]
@@ -2050,20 +2807,20 @@ func (userdata *User) CreateInvitation(filename string, recipientUsername string
     }
 
 	if namespaceEntry.IsOwner {
-        userlib.DatastoreSet(
+        datastoreSet(
 			grantedBoxUUID,
 			protectedBranchBox,
 		)
 
 		if structureChanged {
-			userlib.DatastoreSet(
+			datastoreSet(
 				namespaceEntry.AccessBoxStructureUUID,
 				protectedUpdatedStructure,
 			)
 		}
 	}
 
-	userlib.DatastoreSet(
+	datastoreSet(
         invitationUUID,
         invitationBytes,
     )
@@ -2092,7 +2849,7 @@ func openInvitation(
     }
 
     invitationBytes, exists :=
-        userlib.DatastoreGet(invitationPtr)
+        datastoreGet(invitationPtr)
 
     if !exists {
         return emptyPayload,
@@ -2112,7 +2869,7 @@ func openInvitation(
 
     //Get the verification key
     senderVerifyKey, exists :=
-        userlib.KeystoreGet(
+        keystoreGet(
             getVerifyKeyName(senderUsername),
         )
 
@@ -2268,10 +3025,49 @@ func openInvitation(
     return payload, nil
 }
 
+// AcceptInvitation is the strict-2PL transaction boundary for invitation
+// acceptance. Lock acquisition order: X(namespace(recipient, filename)) ->
+// S(file(FileID)). Namespace needs X (not S) because this operation
+// performs a check-then-act on destination-filename occupancy, exactly
+// like StoreFile's create path -- that check must be atomic with respect
+// to every other concurrent writer of (recipient, filename), including
+// another AcceptInvitation and StoreFile itself. File only needs S: this
+// operation never mutates shared file state, it only needs an
+// authoritative, current read of the granted AccessBox/FileStatus to
+// decide whether the capability it is about to install is still valid.
+//
+// This is the operation where the Phase 1 audit's TOCTOU race lived most
+// visibly: the old code validated the AccessBox/FileStatus once, with no
+// lock at all, and then installed a NamespaceEntry based on that single
+// snapshot -- a concurrent RevokeAccess could commit in between validation
+// and install, handing the recipient a NamespaceEntry that *looked*
+// installed but pointed at already-revoked capability state. Under File S,
+// that window is closed: RevokeAccess needs File X, so it cannot commit
+// while this validation is in flight, and if it already committed before
+// this validation's File S was granted, that validation (via
+// validateInvitationAccessUnderLock's call to verifyFileStatus) is
+// guaranteed to observe it and fail.
 func (userdata *User) AcceptInvitation(senderUsername string, invitationPtr uuid.UUID, filename string) error {
 	if userdata == nil {
         return errors.New("recipient cannot be nil")
     }
+
+	txn, err := allocateTxnID()
+	if err != nil {
+		return err
+	}
+
+	guard := newOperationGuard(txn)
+	defer guard.ReleaseAll()
+
+	nsResource, err := namespaceResourceID(userdata.Username, filename)
+	if err != nil {
+		return err
+	}
+
+	if err := guard.Acquire(nsResource, lockmanager.ExclusiveLock); err != nil {
+		return err
+	}
 
 	nameUUID, err := getNameSpaceEntryUUID(
         userdata.Username,
@@ -2281,7 +3077,11 @@ func (userdata *User) AcceptInvitation(senderUsername string, invitationPtr uuid
         return err
     }
 
-	_, occupied := userlib.DatastoreGet(nameUUID)
+	// Occupancy check performed while Namespace X is held: no concurrent
+	// AcceptInvitation or StoreFile for this same (recipient, filename)
+	// can install/observe a different namespace state in between this
+	// check and this operation's own eventual install below.
+	_, occupied := datastoreGet(nameUUID)
 
     if occupied {
         return errors.New("filename is already in use")
@@ -2305,29 +3105,20 @@ func (userdata *User) AcceptInvitation(senderUsername string, invitationPtr uuid
         return err
     }
 
-	var accessBox AccessBox
+	fileResource := fileResourceID(payload.FileID)
+	if err := guard.Acquire(fileResource, lockmanager.SharedLock); err != nil {
+		return err
+	}
 
-    err = loadDatastoreObject(
-        accessBoxObjectType,
-        payload.AccessBoxUUID,
-        payload.AccessBoxEncKey,
-        payload.AccessBoxMACKey,
-        &accessBox,
-    )
-    if err != nil {
-        return err
-    }
+	// Revalidated fresh, under File S -- this is the authoritative check
+	// that a concurrent RevokeAccess cannot race past (see doc comment
+	// above).
+	_, err = validateInvitationAccessUnderLock(payload)
+	if err != nil {
+		return err
+	}
 
-    if accessBox.FileID != payload.FileID {
-        return errors.New(
-            "invitation and AccessBox FileID mismatch",
-        )
-    }
-
-	err = verifyFileStatus(accessBox)
-    if err != nil {
-        return err
-    }
+	fireConcurrencyTestHook("accept:validated:" + payload.FileID.String())
 
 	sharedEntry := NamespaceEntry{
         IsOwner: false,
@@ -2355,32 +3146,69 @@ func (userdata *User) AcceptInvitation(senderUsername string, invitationPtr uuid
         return err
     }
 
-	userlib.DatastoreSet(
+	datastoreSet(
         nameUUID,
         protectedNamespaceEntry,
     )
 
-    userlib.DatastoreDelete(invitationPtr)
+    datastoreDelete(invitationPtr)
 
     return nil
 }
 
+// RevokeAccess is the strict-2PL transaction boundary for revocation.
+// Lock acquisition order: S(namespace(owner, filename)) -> X(file(FileID)).
+// File needs X because this operation is the single owner of epoch
+// rotation for a file: it replaces Metadata (new MetadataUUID, chunk,
+// content re-encrypted under a new FileRoot), rewrites the owner AccessBox
+// and every surviving branch AccessBox, rewrites AccessBoxStructure, and
+// publishes a new signed FileStatus -- none of that may interleave with a
+// concurrent LoadFile/AppendToFile/CreateInvitation/another RevokeAccess
+// on the same file, all of which also require File S or X. IsOwner is
+// checked immediately after the namespace-only loadNamespaceEntry, before
+// File X is even requested, because ownership is a property of the
+// caller's own NamespaceEntry that no other user's operation can change --
+// it needs no file-lock revalidation.
 func (userdata *User) RevokeAccess(filename string, recipientUsername string) error {
-	//First get the current namespace entry and accessbox
-	namespaceEntry, currentAccessBox, err := resolveFile(
-		userdata,
-		filename,
-	)
-
+	txn, err := allocateTxnID()
 	if err != nil {
-        return err
-    }
+		return err
+	}
+
+	guard := newOperationGuard(txn)
+	defer guard.ReleaseAll()
+
+	nsResource, err := namespaceResourceID(userdata.Username, filename)
+	if err != nil {
+		return err
+	}
+
+	if err := guard.Acquire(nsResource, lockmanager.SharedLock); err != nil {
+		return err
+	}
+
+	namespaceEntry, err := loadNamespaceEntry(userdata, filename)
+	if err != nil {
+		return err
+	}
 
 	if !namespaceEntry.IsOwner {
         return errors.New(
             "only the file owner can revoke access",
         )
     }
+
+	fileResource := fileResourceID(namespaceEntry.FileID)
+	if err := guard.Acquire(fileResource, lockmanager.ExclusiveLock); err != nil {
+		return err
+	}
+
+	// Revalidated fresh, under File X -- never reuse AccessBox/FileStatus
+	// state read before this lock was granted.
+	currentAccessBox, err := validateFileAccessUnderLock(namespaceEntry)
+	if err != nil {
+		return err
+	}
 
 	//load the structure
 	structure, err :=
@@ -2415,6 +3243,8 @@ func (userdata *User) RevokeAccess(filename string, recipientUsername string) er
     if err != nil {
         return err
     }
+
+	fireConcurrencyTestHook("revoke:content-loaded:" + currentAccessBox.FileID.String())
 
 	//All clear, time to update the new access box for users
 	newEpochID := uuid.New()
@@ -2461,9 +3291,14 @@ func (userdata *User) RevokeAccess(filename string, recipientUsername string) er
         return err
     }
 
+	// Epoch rotation re-encrypts the same logical content under a new
+	// epoch/FileRoot/keys -- it is a physical migration of authorization
+	// state, not a logical content mutation, so Version is carried over
+	// unchanged rather than advanced (only EpochID changes).
 	newMetadata := Metadata{
         FileID:     currentAccessBox.FileID,
         EpochID:    newEpochID,
+        Version:    metadata.Version,
         TailUUID:   newBaseChunkUUID,
         ChunkCount: 1,
     }
@@ -2581,48 +3416,48 @@ func (userdata *User) RevokeAccess(filename string, recipientUsername string) er
         return err
     }
 
-	userlib.DatastoreSet(
+	datastoreSet(
         newBaseChunkUUID,
         protectedNewChunk,
     )
 
-    userlib.DatastoreSet(
+    datastoreSet(
         newMetadataUUID,
         protectedNewMetadata,
     )
 
-	userlib.DatastoreSet(
+	datastoreSet(
         namespaceEntry.AccessBoxUUID,
         protectedOwnerAccessBox,
     )
 
 	for _, write := range survivingWrites {
-        userlib.DatastoreSet(
+        datastoreSet(
             write.BoxUUID,
             write.Data,
         )
     }
 
-	userlib.DatastoreSet(
+	datastoreSet(
         namespaceEntry.AccessBoxStructureUUID,
         protectedUpdatedStructure,
     )
 
-    userlib.DatastoreSet(
+    datastoreSet(
         currentAccessBox.StatusUUID,
         newFileStatusBytes,
     )
 
-	userlib.DatastoreDelete(
+	datastoreDelete(
         revokedRecord.BoxUUID,
     )
 
-    userlib.DatastoreDelete(
+    datastoreDelete(
         currentAccessBox.MetadataUUID,
     )
 
     for _, oldChunkUUID := range oldChunkUUIDs {
-        userlib.DatastoreDelete(oldChunkUUID)
+        datastoreDelete(oldChunkUUID)
     }
 
     return nil
