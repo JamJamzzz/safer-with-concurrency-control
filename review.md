@@ -143,20 +143,24 @@ Two unrelated mechanisms, deliberately not conflated:
 - **`saferLockManager`** (transaction locks): S/X, per logical resource,
   may be held across an entire operation, provides SAFER's serializability
   guarantees.
-- **`datastoreMu`/`keystoreMu`** (storage latches): plain `sync.RWMutex`,
-  held only for the duration of one raw `userlib.Datastore*`/`Keystore*`
-  call, exist only because `userlib`'s maps are not goroutine-safe (Go's
-  runtime crashes the whole process on concurrent map access, independent
-  of SAFER's own logic). Discovered when Phase 4's first real concurrent
-  test crashed the process. All production access goes through five thin
+- **`datastoreMu`/`keystoreMu`** (storage latches): a `sync.Mutex` for
+  datastore calls and `sync.RWMutex` for keystore calls, held only for one
+  raw call. The datastore latch protects both the map and userlib's shared
+  bandwidth counter, which even `DatastoreGet` mutates. The original
+  read-latch implementation prevented map crashes but left concurrent
+  Gets racing on that counter; Linux CI exposed this (section 8).
+  All production access in `client.go` goes through five thin
   wrappers (`datastoreGet/Set/Delete`, `keystoreGet/Set`); audited clean
   (zero unwrapped production call sites).
 
 ## 7. Test evidence
 
-54 white-box specs in `client/*_test.go` (Ginkgo) plus 15 standalone
-`lockmanager` tests plus the full pre-existing black-box `client_test`
-suite, covering every phase:
+The unmodified CI-phase baseline at `c170400` passed 43 white-box specs in
+`client/*_test.go` (Ginkgo), 80 black-box specs in `client_test`, 15 standalone
+`lockmanager` tests, and 4 benchmark UI tests: 142 tests/specs, zero failed,
+pending, or skipped. Ginkgo's two Go test wrapper functions are not counted
+again. Command: `go test -json -count=1 ./...`, Go 1.26.5, Windows/amd64.
+Coverage includes:
 
 - **LockManager** (Phase 2): S/S coexistence, X blocks S/X, independent
   resources don't conflict, writer fairness (a queued X is never bypassed
@@ -172,7 +176,8 @@ suite, covering every phase:
   exactly once; a forced schedule proves a second append cannot reach its
   own Metadata read until the first releases File X; Load-vs-overwrite in
   both orderings never observes partial/mixed state; append-vs-overwrite
-  settles into one legal serial ordering across 30 forced iterations;
+  settles into one legal serial ordering across 30 concurrent iterations
+  (the append/overwrite winner is scheduler-selected, not forced);
   concurrent overwrites serialize; same-name creates serialize into one
   logical file; independent files provably never block each other (hook-
   forced); 20 concurrent readers provably batch under Shared (not
@@ -184,47 +189,121 @@ suite, covering every phase:
   orderings; Revoke-vs-CreateInvitation in both orderings never loses or
   resurrects a recipient; two concurrent revokes on the same file both
   survive; Accept-vs-StoreFile namespace collision resolves to one legal
-  state. Every test additionally re-validates persistent authorization
+  state. The suite additionally re-validates persistent authorization
   invariants (owner-epoch == structure-epoch, surviving recipients stamped
   with the current epoch, Version preserved), not just return values.
 - **Phase 4.5 hardening**: namespace-identity collision fix verified
   directly; TxnID allocator proven to fail *permanently*, not just once,
   past exhaustion; storage-latch coverage audited clean; test-hook
-  race-safety confirmed.
+  get/set behavior exercised concurrently (the atomic accessor is not a
+  claim about arbitrary callbacks installed by callers).
 - **Phase 6**: the two benchmark-only baseline strategies were themselves
   validated before being trusted for benchmarking — `StrategyNoCC` is
   proven (deterministically, via forced scheduling, not luck) to reproduce
   the classic lost-update race; `StrategyGlobalLock` is proven to serialize
   even operations on independent files, unlike production SAFER-CC.
 
-Every test suite was re-run repeatedly (20+ full-suite iterations at
-various points, since Ginkgo doesn't support `go test -count`) with zero
-flakes observed.
+Earlier development reports recorded repeated suite runs. The CI-phase
+baseline and pre-push rerun both passed, with no flakes observed in those
+runs; this is not a guarantee of flake freedom. `-count=1` is supported and
+disables cached results. Do not use `-count=N` for repeated Ginkgo suites;
+rerun the process instead. Existing stress cases already run in `./...`,
+so CI does not add a duplicate stress job.
 
 ## 8. Race-detector evidence/status
 
-**NOT VERIFIED WITH GO RACE DETECTOR.** This development environment
-(Windows) has no C compiler (`gcc`/`clang` not found, `CGO_ENABLED=0`),
-and `go test -race` requires cgo. WSL is present but only as Docker
-Desktop's minimal internal VM (`PRETTY_NAME="Docker Desktop"`, no `gcc`,
-no `go`) — not a general-purpose Linux development environment, so no
-toolchain was provisioned into it.
+**Full Linux race-detector suite passed after the storage-counter fix.**
+[Hosted run 33740706536](https://github.com/JamJamzzz/safer-with-concurrency-control/actions/runs/33740706536),
+PR head `5a124d0`, passed both jobs on 2026-09-03 UTC: all 143 tests/specs,
+zero failures/pending/skips, and no race reports. The full race job took
+about 107 seconds including setup, so no reduced/targeted CI suite was needed.
+This is PR evidence; subsequent default-branch executions are visible in
+[main's CI history](https://github.com/JamJamzzz/safer-with-concurrency-control/actions/workflows/ci.yml?query=branch%3Amain).
 
-To verify once a suitable environment is available (Linux, WSL with a real
-distro, or Windows with mingw-w64 on `PATH`):
+The original Windows environment still has no C compiler
+and `CGO_ENABLED=0`: a local `go test -race ./...` exits before testing with
+`-race requires cgo`. CI supplies the missing toolchain instead of
+pretending the local limitation has disappeared.
+
+[CI](.github/workflows/ci.yml) runs on pull requests and pushes to `main`,
+using two independent `ubuntu-latest` jobs with `contents: read` permissions.
+Go comes from `go.mod` (`go 1.20`, no `toolchain` directive); the observed
+runner used Go **1.20.14**, Linux/amd64, Ubuntu **24.04.4**, and GCC
+**13.3.0**. The race job explicitly checks `CGO_ENABLED=1`, the compiler,
+Go version, and all four packages before executing the full suite. The
+normal job runs with cgo disabled, confirming cgo is not a project dependency.
+
+Reproduce from the repository root (the second command uses a POSIX shell
+and requires a supported Go race-detector platform plus a C compiler):
 
 ```bash
-go test -race ./...
-go test -race -count=50 ./client/lockmanager/...
-go test -race -count=20 ./client/...
+go test -mod=readonly -count=1 -v -timeout=10m ./...
+CGO_ENABLED=1 CC=gcc go test -race -mod=readonly -count=1 -v -timeout=15m ./...
 ```
 
-Correctness in this environment was instead demonstrated via deterministic,
-hook-forced concurrency tests (proving specific lock-ordering outcomes, not
-timing-dependent guesses) and many repeated full-suite runs. This is
-real evidence of *logical* correctness; it is not a substitute for `-race`
-verification of Go-level memory-safety, and no claim of memory-race
-freedom is made here.
+`-count=1` disables cached test results. No packages, existing stress cases,
+or intentionally incorrect NoCC logical-control tests are excluded. No
+failure suppression, retries, or performance gates are configured.
+
+### Actual failure and fix
+
+[First hosted run, 33740280680](https://github.com/JamJamzzz/safer-with-concurrency-control/actions/runs/33740280680)
+tested PR head `b8447fd`: normal correctness passed; race detection failed
+in `client`. All 43 white-box logical specs passed even in the failing race
+job, but Go correctly failed the package for detected memory races. The
+other three packages passed. This illustrates why both verification layers
+are necessary.
+
+The 32 race reports all share one root cause: both conflicting accesses
+reach `project2-userlib@v0.5.1/userlib.go:139`, the read/modify/write
+`*bandwidth += len(value)` inside `datastoreGet`. For example, two goroutines
+in Phase 4's 100-append test follow
+`AppendToFile -> loadNamespaceEntry -> loadDatastoreObject -> datastoreGet`,
+then read/write the same counter. Other reports involve concurrent loads,
+invitations, and revokes; both access stacks still end at that same line.
+The shard's `sync.Map` protects lookup, not the pointed-to integer.
+
+This is a metrics race on a production storage path, not a test-hook race
+or merely a benchmark issue. `datastoreGet` formerly used `RLock`, allowing
+multiple readers to modify that shared counter concurrently. The fix
+(`908dc13`) uses one exclusive datastore mutex for each raw Get/Set/Delete
+call. Keystore reads retain their read latch. Crypto and whole operations
+are not moved inside this mutex, and namespace/file S/X strict 2PL is
+unchanged; the existing independent-file and shared-reader tests remain.
+
+The one added regression, `client/storage_concurrency_test.go`, starts 16
+workers together, each reading its own key 64 times, then joins all workers
+and checks exact bytes returned and bandwidth (7,168 bytes). The pre-fix
+code actually reported 7,119; the fixed code passed. There are no sleep or
+throughput assertions. Scheduling is not exhaustively controlled, so this
+exact-value oracle complements rather than replaces race instrumentation.
+The full post-fix local suite passed 44 white-box + 80 black-box specs + 15
+lockmanager + 4 UI tests (143 total), zero failures/pending/skips.
+
+### Interpretation and limits
+
+A successful race run means no memory race was reported in that execution;
+it does not prove universal race freedom, serializability, fairness, or
+authorization correctness. Forced-ordering tests, lock-manager tests, and
+persistent invariants check those higher-level properties for their tested
+scenarios. The acquisition-site audit confirms Namespace-before-File and
+deferred `ReleaseAll` for the six file/sharing operations; the tests exercise
+successful and failing paths, not every possible failure injection.
+
+CI covers one Linux/amd64 Go release series, not an OS/toolchain matrix.
+Tests have bounded liveness waits and finite schedules. Locks coordinate
+only participating goroutines in one process; direct external mutation of
+userlib maps or mutable User fields bypasses that boundary. Test/benchmark
+setup, clears, and diagnostic reads must remain outside active workers.
+Account creation is not a file-level 2PL transaction. No crash rollback,
+durability, or distributed coordination is established. The standalone
+benchmark workload driver is not executed by `go test`; its UI tests and
+the NoCC/GlobalLock strategy regressions are included.
+
+GitHub-runner throughput/latency is never a correctness gate or resume
+benchmark evidence. The checked-in benchmark tables predate the exclusive
+read-latch fix; they are preserved as historical measurements, not claimed
+as remeasurement of the corrected code.
 
 ## 9. Benchmark evidence
 
@@ -285,8 +364,8 @@ operation differs (`client.go`, `newOperationGuard`):
 - **No wait-for-graph deadlock detection**: correctness instead rests on
   the fixed Namespace-before-File ordering, verified by code review (every
   acquisition site follows it) and empirically by zero deadlocks/hangs
-  across dozens of full-suite and benchmark runs involving all seven
-  operations mixed together (Workload E).
+  across the recorded file/sharing test suites and mixed-operation
+  authorization benchmark (Workload E), not a formal deadlock proof.
 
 ## 12. Generated evaluation files
 
@@ -298,7 +377,9 @@ operation differs (`client.go`, `newOperationGuard`):
 
 ## 13. Technically defensible resume bullet candidates
 
-Based only on the measured evidence above:
+These historical candidates refer to the recorded, pre-CI benchmark
+revision. Performance claims must be remeasured for the corrected datastore
+latch before describing current-code performance:
 
 - *Designed and implemented a fine-grained shared/exclusive lock manager in
   Go with strict two-phase locking, deterministic lock ordering, and
@@ -321,8 +402,8 @@ Based only on the measured evidence above:
   implementing storage-engine memory-safety latches from higher-level
   transaction locks.*
 
-Do **not** use: "distributed locking" (it is not distributed), "verified
-race-free with `go test -race`" (not run in this environment), or any
+Do **not** use: "distributed locking" (it is not distributed), "proven
+race-free" (finite dynamic tests cannot prove that), or any
 specific "X times faster" claim not tied to the exact workload/worker
 count/median-of-N stated above.
 
@@ -341,22 +422,17 @@ count/median-of-N stated above.
 | `EpochID` semantics (rotates only on revoke, `Version` preserved) | ✅ tested | Phase 5 revoke tests + `checkAuthorizationInvariants` |
 | Capability revalidation under File lock | ✅ tested | Phase 5 Tests 3-8 |
 | Datastore/keystore latch coverage | ✅ audited | Phase 4.5 A3, re-confirmed in Phase 6 |
-| Persistent authorization invariants | ✅ tested | `CheckAuthorizationInvariantsForBenchmark`, used in every Phase 5/6 test |
+| Persistent authorization invariants | ✅ tested | Phase 5's `checkAuthorizationInvariants` and the benchmark diagnostic checker |
 | Error-path lock release | ✅ tested | Phase 4 Test 25 |
-| Go race-detector verification | ❌ not verified | no C toolchain in this environment (documented above) |
+| Go race-detector verification | ✅ full Linux suite passed | run `33740706536` after fixing the bandwidth race; see section 8 |
 
-Every property above has direct test or benchmark evidence except
-`-race` verification, which is explicitly and honestly flagged as
-outstanding rather than assumed.
+The entries distinguish code audits, logical assertions, and dynamic
+memory-race checks; none is a proof across all executions.
 
-## Recommendation
+## Verification scope
 
-SAFER-CC V1 is **resume-ready as a systems/concurrency-control project**,
-with the caveats stated throughout this document disclosed alongside any
-claim: correctness is backed by ~55 deterministic, hook-forced concurrency
-tests plus real (not simulated) benchmark evidence including one honestly
-reported non-win; the one open item is Go race-detector verification,
-which requires an environment this session does not have and should be
-run before any claim of memory-race freedom. No further V1 feature work
-(caching, MVCC, distributed locking, WAL, replication) should be added —
-V1's scope is complete and evaluated.
+CI adds repeatable normal and instrumented execution to the existing
+logical tests without adding a new concurrency model. Claims should remain
+bounded by the run evidence, the tested invariants, and the limitations in
+section 8. No new storage, deployment, or distributed-system feature is part
+of this verification change.
