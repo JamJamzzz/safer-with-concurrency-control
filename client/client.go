@@ -139,18 +139,23 @@ func someUsefulThings() {
 // its own, separate guard -- analogous to a real database engine's
 // storage-layer buffer-pool latches being a different mechanism from its
 // transaction manager's row/table locks. datastoreMu/keystoreMu below are
-// that guard: a plain RWMutex around every raw Datastore/Keystore access,
-// with no TxnID, no 2PL semantics, and no participation in
+// that guard: a Mutex around every raw Datastore access and an RWMutex
+// around Keystore accesses. DatastoreGet is NOT read-only: userlib v0.5.1
+// increments its shared bandwidth counter even when reading distinct keys,
+// so allowing concurrent Gets under RLock races on that counter. Hold the
+// datastore latch exclusively for the single raw call (including its copy
+// and accounting), not for the surrounding logical operation. These latches
+// have no TxnID, no 2PL semantics, and no participation in
 // saferLockManager whatsoever. Every production call site in this file
 // goes through the datastoreGet/datastoreSet/datastoreDelete/
 // keystoreGet/keystoreSet wrappers below instead of calling
 // userlib.Datastore*/Keystore* directly.
-var datastoreMu sync.RWMutex
+var datastoreMu sync.Mutex
 var keystoreMu sync.RWMutex
 
 func datastoreGet(id uuid.UUID) ([]byte, bool) {
-	datastoreMu.RLock()
-	defer datastoreMu.RUnlock()
+	datastoreMu.Lock()
+	defer datastoreMu.Unlock()
 	return userlib.DatastoreGet(id)
 }
 
