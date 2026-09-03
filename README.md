@@ -22,8 +22,11 @@ list before testing. `-count=1` disables test-result caching and
 tests; they are not performance thresholds.
 
 The original Windows environment lacked a C compiler and had cgo disabled.
-Linux CI provides that toolchain; an actual successful hosted run is still
-required before claiming race-detector verification. See
+The full race suite passed on Linux after fixing a shared datastore
+bandwidth-counter race, in
+[hosted run 33740706536](https://github.com/JamJamzzz/safer-with-concurrency-control/actions/runs/33740706536)
+(Go 1.20.14, GCC 13.3.0). Linux CI supplies the missing toolchain; it does
+not change the local Windows environment. See
 [the evidence/status section](review.md#8-race-detector-evidencestatus).
 To reproduce the race command locally, use Linux with Go and GCC (or another
 Go-supported race-detector platform with its required C toolchain).
@@ -35,6 +38,10 @@ schedules correct or establishes system-wide serializability by itself.
 Locks are in-process; crash recovery and cross-process coordination are
 outside V1's scope. Benchmarks remain a separate manual tool, not CI
 throughput/latency gates or GitHub-runner performance evidence.
+The checked-in benchmark tables predate the datastore race fix and are
+historical measurements, not current-code performance claims.
+
+[Latest main-branch CI runs](https://github.com/JamJamzzz/safer-with-concurrency-control/actions/workflows/ci.yml?query=branch%3Amain)
 
 ## Concurrency benchmark
 

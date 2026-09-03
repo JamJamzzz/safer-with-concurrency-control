@@ -12,6 +12,24 @@ protocol -- see "System-wide protocol summary (Phase 5)" near the end of
 this document for the final operation matrix and the precise scope of that
 claim.
 
+## CI verification
+
+The phase-by-phase sections below include historical development notes.
+The current CI commands, actual hosted-run evidence, storage-counter race
+analysis, and remaining limits are maintained in
+[review.md, section 8](../review.md#8-race-detector-evidencestatus).
+The workflow runs the complete normal and race-instrumented suites on
+GitHub-hosted Linux for pull requests and pushes to `main`. The original
+Windows no-cgo/C-compiler limitation is local, not a reason to omit the
+Linux race job. The complete normal and race suites passed in
+[run 33740706536](https://github.com/JamJamzzz/safer-with-concurrency-control/actions/runs/33740706536)
+after the datastore bandwidth-counter fix, with 143 tests/specs and no skips.
+
+Race detection concerns memory accesses in executed paths; strict-2PL and
+authorization-invariant tests concern logical operation outcomes. Neither
+layer proves all possible schedules correct. Runner timings are not
+performance gates, and the historical benchmark files are not updated by CI.
+
 ## LockManager (`client/lockmanager`)
 
 ### Purpose and scope
@@ -201,13 +219,10 @@ part of any production API.
   not being able to recover from a caller that never releases (which strict
   2PL with `defer`/`LockGuard` discipline in later phases is intended to
   prevent structurally, not via manager-side timeouts).
-- The Go race detector (`go test -race`) could not be run in this
-  development environment because it requires cgo and no C toolchain
-  (gcc/clang) is installed on this machine. This is an environment
-  limitation, not a code limitation, and should be re-run (`go test -race
-  -count=100 ./client/lockmanager/...`) in any environment with a C
-  toolchain (e.g. Linux/WSL, or Windows with `mingw-w64`/`gcc` on `PATH`)
-  before treating the implementation as fully verified. In lieu of that,
+- During Phase 2, the Windows development environment lacked the C
+  toolchain/cgo needed by the race detector. This historical limitation
+  does not describe the current Linux CI setup; see "CI verification"
+  above for current status. At that development stage,
   50 repeated full-suite runs (`go test -count=50 ./client/lockmanager/...`,
   ~90s) passed with no flakes, including the stress test that continuously
   checks the "at most one X holder, and S/X mutual exclusion" invariant
@@ -457,8 +472,8 @@ touched. This was reproduced directly by Phase 4's own 100-concurrent-append
 test before this fix.
 
 This is a different mechanism from `saferLockManager` and intentionally
-does not reuse it: a plain `sync.RWMutex` pair (`datastoreMu`, `keystoreMu`)
-now guards every raw `userlib.Datastore*`/`Keystore*` call, via thin
+does not reuse it: storage latches (`datastoreMu`, `keystoreMu`)
+guard every production `userlib.Datastore*`/`Keystore*` call, via thin
 wrappers (`datastoreGet`/`datastoreSet`/`datastoreDelete`/`keystoreGet`/
 `keystoreSet`) that every production call site in `client.go` now goes
 through instead of calling `userlib.*` directly. It has no `TxnID`, no 2PL
@@ -467,6 +482,15 @@ a storage-engine-level latch, analogous to a real database's buffer-pool
 latching being distinct from its transaction manager's row/table locks.
 Without it, Phase 4's own concurrency would crash the process before its
 locking logic could even be observed to work.
+
+CI-phase correction: the original pair of `sync.RWMutex` latches was
+insufficient. `userlib.DatastoreGet` increments a shared bandwidth counter,
+so even reads of unrelated keys must not overlap inside userlib. The
+datastore latch is now a `sync.Mutex` held for one raw call; keystore retains
+its `sync.RWMutex`. This does not serialize entire operations, crypto work,
+or logical readers. Existing independent-file and shared-reader tests
+continue to check those distinctions. Raw test/benchmark resets and
+diagnostics must only run after workers have stopped.
 
 ### Current limitations (Phase 4, superseded below)
 
@@ -480,11 +504,10 @@ locking logic could even be observed to work.
 - No claim of system-wide linearizability is made yet -- only that the
   three Phase-4-integrated operations are mutually serializable/consistent
   with each other.
-- The Go race detector could not be run (no C toolchain / cgo available in
-  this environment, same limitation noted in the Phase 2 section); see the
-  Phase 4 completion report for the exact re-run command. Correctness here
-  is demonstrated via deterministic, hook-driven concurrency tests plus
-  repeated full-suite runs, not `-race`.
+- At the Phase 4 milestone, the race detector had not run because of the
+  local C-toolchain limitation. The hook-driven tests and repeated runs
+  were logical correctness evidence, not memory-race verification. See
+  "CI verification" above for the later hosted race results.
 
 *(This bullet list described the state of the system as of Phase 4. It is
 now superseded -- Phase 5, below, integrates `CreateInvitation`/
@@ -832,13 +855,8 @@ cleanly and observe only complete, lock-consistent state.*
   and `CreateInvitation`/`RevokeAccess` on the same file cannot currently
   proceed concurrently even though (in the common case) they touch
   disjoint pieces of that file's state.
-- **Race detector: NOT VERIFIED WITH GO RACE DETECTOR.** No C toolchain
-  (gcc/clang) is available in this development environment, so `go test
-  -race ./...` could not be run for Phase 4, Phase 4.5, or Phase 5.
-  Correctness is instead demonstrated via deterministic, hook-driven
-  concurrency tests (forced schedules proving specific orderings, not
-  timing-based guesses) plus many repeated full-suite runs. This must be
-  run -- and pass -- before any claim of memory-race freedom, and before
-  any resume bullet implying `-race` validation. See the Phase 5 completion
-  report for the exact commands to run once a suitable toolchain (e.g.
-  WSL/Linux, or mingw-w64 on Windows) is available.
+- **Race-detector scope:** Linux CI now runs the full instrumented suite;
+  see "CI verification" above for observed results. The original local
+  toolchain limitation is recorded historically, not used as a substitute
+  for the hosted check. Passing instrumented executions do not prove
+  universal memory-race freedom or logical serializability.
