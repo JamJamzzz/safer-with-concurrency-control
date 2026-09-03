@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  correctness:
+    name: Correctness
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CGO_ENABLED: '0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Verify Go and packages
+        run: |
+          go version
+          go env GOOS GOARCH CGO_ENABLED
+          go list ./...
+      - name: Test all packages (uncached)
+        run: go test -mod=readonly -count=1 -v -timeout=10m ./...
+
+  race:
+    name: Race detector
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CGO_ENABLED: '1'
+      CC: gcc
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Verify race toolchain and packages
+        run: |
+          go version
+          go env GOOS GOARCH CGO_ENABLED CC
+          test "$(go env CGO_ENABLED)" = "1"
+          command -v "$CC"
+          "$CC" --version
+          go list ./...
+      - name: Race-test all packages (uncached)
+        run: go test -race -mod=readonly -count=1 -v -timeout=15m ./...
